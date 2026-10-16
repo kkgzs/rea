@@ -443,6 +443,7 @@ const abortIfNeeded = (signal?: AbortSignal): void => {
     throw new ArtifactReaderFailure(
       "cancelled",
       "Artifact traversal cancelled",
+      { cause: signal.reason },
     );
 };
 

@@ -10,6 +10,25 @@ import {
   type FileIdentity,
 } from "./SafeOutputTreeIdentity.js";
 
+const isAborted = (signal?: AbortSignal): boolean => signal?.aborted === true;
+
+const isCancellationError = (cause: unknown, signal?: AbortSignal): boolean => {
+  if (isAborted(signal) && cause === signal?.reason) return true;
+  if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+    return true;
+  if (
+    cause instanceof Error &&
+    (cause.name === "AbortError" || cause.message.includes("aborted"))
+  )
+    return true;
+  return false;
+};
+
+const cancellationFailure = (signal?: AbortSignal, cause?: unknown) =>
+  new ArtifactReaderFailure("cancelled", "Artifact extraction cancelled", {
+    cause: signal?.reason ?? cause,
+  });
+
 /** Hash one retained readback descriptor and confirm it still names the output file. */
 export const hashOutputFile = async (
   owner: OwnedFileHandle,
@@ -20,6 +39,7 @@ export const hashOutputFile = async (
     readonly signal?: AbortSignal | undefined;
   },
 ): Promise<{ readonly sha256: string; readonly bytes: number }> => {
+  if (isAborted(options.signal)) throw cancellationFailure(options.signal);
   const admittedIdentity = await readFileIdentity(owner.handle, path);
   await assertFilePathIdentity(path, identity);
   if (
@@ -34,11 +54,7 @@ export const hashOutputFile = async (
   let bytes = 0;
   try {
     for await (const raw of readFileHandleChunks(owner.handle, options)) {
-      if (options.signal?.aborted === true)
-        throw new ArtifactReaderFailure(
-          "cancelled",
-          "Artifact extraction cancelled",
-        );
+      if (isAborted(options.signal)) throw cancellationFailure(options.signal);
       const chunk = streamChunkToBuffer(raw);
       bytes += chunk.length;
       if (bytes > options.maximum)
@@ -49,14 +65,12 @@ export const hashOutputFile = async (
       hash.update(chunk);
     }
   } catch (cause: unknown) {
-    if (options.signal?.aborted === true)
-      throw new ArtifactReaderFailure(
-        "cancelled",
-        "Artifact extraction cancelled",
-        { cause },
-      );
+    if (isCancellationError(cause, options.signal))
+      throw cancellationFailure(options.signal, cause);
     throw cause;
   }
+  if (isAborted(options.signal)) throw cancellationFailure(options.signal);
   await assertFilePathIdentity(path, identity);
+  if (isAborted(options.signal)) throw cancellationFailure(options.signal);
   return { sha256: hash.digest("hex"), bytes };
 };

@@ -265,6 +265,7 @@ export class SafeOutputTree {
       await this.#closeHandle(readbackHandle);
       await this.#assertLineage(lineage);
       await assertFilePathIdentity(destination, fileIdentity);
+      abortIfNeeded(signal);
       if (readback.sha256 !== sha256 || readback.bytes !== bytes)
         throw new ArtifactReaderFailure(
           "integrity",
@@ -605,6 +606,7 @@ const abortIfNeeded = (signal?: AbortSignal): void => {
     throw new ArtifactReaderFailure(
       "cancelled",
       "Artifact extraction cancelled",
+      { cause: signal.reason },
     );
 };
 
