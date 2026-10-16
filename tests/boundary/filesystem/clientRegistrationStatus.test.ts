@@ -112,6 +112,34 @@ describe("client registration status", () => {
       ]);
     },
   );
+
+  it("reports an otherwise aligned registration invalid for a bad tool-family scope", async () => {
+    const home = await createTestTempDirectory("rea-registration-env-");
+    await mkdir(join(home, ".cursor"));
+    await writeFile(
+      join(home, ".cursor/mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          rea: {
+            command: "npx",
+            args: ["-y", PRODUCT_IDENTITY.registrationPackageSpecifier, "mcp"],
+            env: { REA_MCP_TOOL_FAMILIES: "session,typo" },
+          },
+        },
+      }),
+    );
+
+    const statuses = await readClientRegistrationStatuses(home, "/current/rea");
+
+    expect(statuses).toEqual([
+      expect.objectContaining({
+        client: "cursor",
+        state: "invalid",
+        command: [],
+        remediation: expect.stringContaining("REA_MCP_TOOL_FAMILIES"),
+      }),
+    ]);
+  });
 });
 
 describe("client registration launcher identity", () => {

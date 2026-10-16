@@ -69,16 +69,28 @@ export const registerSessionStatusTool = (
         context,
         server.server,
       );
-      let androidAvailability: ProviderAvailability;
+      let androidAvailability: ProviderAvailability | undefined;
       let adbAvailability: ProviderAvailability | undefined;
       let apktoolAvailability: ProviderAvailability | undefined;
       let jebAvailability: JebAnalysisAvailability | undefined;
       try {
+        // Probe only families this registration advertises. Scoped-out
+        // providers keep the established not-configured shape instead of
+        // launching probes whose tools cannot appear in the response.
         const [android, adb, apktool, jeb] = await Promise.all([
-          androidAnalysisAvailability(context.mcpReq.signal),
-          adbAnalysisAvailability?.(context.mcpReq.signal) ?? undefined,
-          apktoolAnalysisAvailability?.(context.mcpReq.signal) ?? undefined,
-          jebAnalysisAvailability?.(context.mcpReq.signal) ?? undefined,
+          server.advertisesFamily("android")
+            ? androidAnalysisAvailability(context.mcpReq.signal)
+            : undefined,
+          server.advertisesFamily("adb")
+            ? (adbAnalysisAvailability?.(context.mcpReq.signal) ?? undefined)
+            : undefined,
+          server.advertisesFamily("apktool")
+            ? (apktoolAnalysisAvailability?.(context.mcpReq.signal) ??
+              undefined)
+            : undefined,
+          server.advertisesFamily("jeb")
+            ? (jebAnalysisAvailability?.(context.mcpReq.signal) ?? undefined)
+            : undefined,
         ] as const);
         androidAvailability = android;
         adbAvailability = adb;
@@ -97,7 +109,9 @@ export const registerSessionStatusTool = (
         status,
         {
           ...availabilityPolicy(),
-          androidAnalysisAvailability: androidAvailability,
+          ...(androidAvailability === undefined
+            ? {}
+            : { androidAnalysisAvailability: androidAvailability }),
           ...(adbAvailability === undefined
             ? {}
             : { adbAnalysisAvailability: adbAvailability }),
@@ -109,7 +123,7 @@ export const registerSessionStatusTool = (
             : { jebAnalysisAvailability: jebAvailability }),
         },
         clientFeatures,
-      );
+      ).filter(({ name }) => server.advertisesTool(name));
       const serverIdentity = createServerIdentity({
         startedAt,
         commandPath: CURRENT_ENTRYPOINT_PATH,

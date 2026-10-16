@@ -19,15 +19,6 @@ import {
 import type { McpOutputSchemaProfile } from "./config/mcpOutputSchemaProfile.js";
 import { RECORDED_CATALOG_DIGESTS } from "./recordedCatalogDigests.js";
 
-const sortByName = (
-  contracts: readonly ToolContract[],
-): readonly ToolContract[] =>
-  [...contracts].sort((left, right) =>
-    compareUnicodeCodePoints(left.name, right.name),
-  );
-
-const sortedToolContracts = sortByName(TOOL_CONTRACTS);
-
 /**
  * Digested per-tool projection. Every contract field that changes what a
  * client receives belongs here, including `returns_target_content`: a server
@@ -66,6 +57,13 @@ const createPromptCatalog = (contracts: readonly PromptContract[]) =>
       steps: contract.steps,
     }))
     .sort((left, right) => compareUnicodeCodePoints(left.name, right.name));
+
+const sortByName = (
+  contracts: readonly ToolContract[],
+): readonly ToolContract[] =>
+  [...contracts].sort((left, right) =>
+    compareUnicodeCodePoints(left.name, right.name),
+  );
 
 const promptCatalog = createPromptCatalog(PROMPT_CONTRACTS);
 
@@ -107,6 +105,7 @@ export type CatalogDigests = ReturnType<typeof createCatalogDigests>;
 
 export const createCatalogIdentity = (
   compactPresentation: CompactInputSchemaPresentation | undefined = undefined,
+  contracts: readonly ToolContract[] = TOOL_CONTRACTS,
   outputSchemaProfile: McpOutputSchemaProfile = "full",
 ) => {
   const selectedPresentation =
@@ -115,19 +114,23 @@ export const createCatalogIdentity = (
       : { budgetBytes: compactPresentation.budgetBytes };
   // Building and canonicalizing every advertised schema dominates doctor and
   // server startup, so the compiled runtime records the default digests once.
+  // Recorded digests describe the complete default catalog only; scoped or
+  // reshaped identities always compute from their own contracts.
   let catalogDigests: CatalogDigests | undefined =
-    selectedPresentation === undefined && outputSchemaProfile === "full"
+    selectedPresentation === undefined &&
+    outputSchemaProfile === "full" &&
+    contracts === TOOL_CONTRACTS
       ? RECORDED_CATALOG_DIGESTS
       : undefined;
   return {
     counts: {
       cli_commands: CLI_COMMAND_NAMES.length,
-      mcp_tools: sortedToolContracts.length,
+      mcp_tools: contracts.length,
       mcp_prompts: promptCatalog.length,
     },
     get digests() {
       return (catalogDigests ??= createCatalogDigests(
-        TOOL_CONTRACTS,
+        contracts,
         PROMPT_CONTRACTS,
         selectedPresentation,
         outputSchemaProfile,

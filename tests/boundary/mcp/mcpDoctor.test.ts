@@ -17,6 +17,8 @@ import {
   createCatalogIdentity,
 } from "../../../src/catalogIdentity.js";
 import { compactPresentationForMcpInputSchemaProfile } from "../../../src/config/mcpInputSchemaProfile.js";
+import { contractsForToolFamilies } from "../../../src/contracts/toolFamilies.js";
+import { TOOL_CONTRACTS } from "../../../src/contracts/toolContracts.js";
 import { MCP_STARTUP_POLICY } from "../../../src/mcpStartupPolicy.js";
 
 afterEach(() => vi.useRealTimers());
@@ -69,7 +71,7 @@ describe("production MCP doctor", () => {
         REA_MCP_INPUT_SCHEMA_PROFILE: "full",
         REA_MCP_OUTPUT_SCHEMA_PROFILE: "off",
       },
-      identity: createCatalogIdentity(undefined, "off"),
+      identity: createCatalogIdentity(undefined, TOOL_CONTRACTS, "off"),
     },
     {
       name: "compact input and output schemas off",
@@ -79,6 +81,7 @@ describe("production MCP doctor", () => {
       },
       identity: createCatalogIdentity(
         compactPresentationForMcpInputSchemaProfile("compact"),
+        TOOL_CONTRACTS,
         "off",
       ),
     },
@@ -120,6 +123,53 @@ describe("production MCP doctor", () => {
     },
     30_000,
   );
+
+  it.each(["session", "session,application"] as const)(
+    "reports a selected family scope healthy with its own inventory and digest",
+    async (families) => {
+      const result = await runProductionMcpDoctor({
+        command: process.execPath,
+        args: [resolve("scripts/rea.mjs"), "mcp"],
+        cwd: process.cwd(),
+        environment: { ...process.env, REA_MCP_TOOL_FAMILIES: families },
+      });
+
+      const expected = contractsForToolFamilies(new Set(families.split(",")));
+      expect(result).toMatchObject({
+        healthy: true,
+        adapter: "production-stdio",
+        inventory: {
+          tools: {
+            expected: expected.length,
+            observed: expected.length,
+            missing: [],
+            unexpected: [],
+          },
+        },
+        request_flow: { tool: "binary_session", ok: true },
+      });
+    },
+    30_000,
+  );
+
+  it("fails startup instead of misreporting inventory for an invalid scope", async () => {
+    const result = await runProductionMcpDoctor({
+      command: process.execPath,
+      args: [resolve("scripts/rea.mjs"), "mcp"],
+      cwd: process.cwd(),
+      environment: { ...process.env, REA_MCP_TOOL_FAMILIES: "session,typo" },
+    });
+
+    expect(result.healthy).toBe(false);
+    expect(result.checks).toContainEqual({
+      name: "transport",
+      ok: false,
+      detail: expect.any(String),
+    });
+    expect(result.diagnostics?.stderr).toEqual(
+      expect.stringContaining("REA_MCP_TOOL_FAMILIES"),
+    );
+  }, 30_000);
 });
 
 describe("production MCP doctor probe validation", () => {
