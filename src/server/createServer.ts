@@ -7,6 +7,9 @@ import { registerSignalTools } from "./registerSignalTools.js";
 import type { WasmArtifactService } from "../application/wasm/WasmArtifactService.js";
 import { wasmArtifactModule } from "../composition/wasm.js";
 import { registerWasmTools } from "./registerWasmTools.js";
+import type { ApkSignatureService } from "../application/apkSignature/ApkSignatureService.js";
+import { apkSignatureModule } from "../composition/apkSignature.js";
+import { registerApkSignatureTools } from "./registerApkSignatureTools.js";
 import { snapshotEnvironment } from "../process/snapshotEnvironment.js";
 import { captureProviderEnvironment } from "./providerEnvironment.js";
 import { createPeResourcesService } from "../composition/binaryDiagnostics.js";
@@ -152,6 +155,7 @@ export interface CreateServerOptions {
   readonly packetCapture?: PacketCaptureService;
   readonly signalRecording?: SignalRecordingService;
   readonly wasmArtifact?: WasmArtifactService;
+  readonly apkSignature?: ApkSignatureService;
   readonly providerEnvironment?: Readonly<NodeJS.ProcessEnv>;
   readonly evmInterface?: EvmInterfaceService;
   readonly sqliteDatabase?: SqliteDatabaseService;
@@ -356,6 +360,10 @@ export const createServer = (
     environment,
     options.wasmArtifact,
   );
+  const apkSignature = apkSignatureModule.create(
+    environment,
+    options.apkSignature,
+  );
   const packetCapture =
     options.packetCapture ?? createPacketCaptureService(environment);
   const signalRecording =
@@ -373,6 +381,7 @@ export const createServer = (
       android.close(),
       fridaInstrumentation.closeAll(),
       wasmArtifact.close(),
+      apkSignature.close(),
       packetCapture.close(),
       signalRecording.close(),
       apktool.close(),
@@ -543,6 +552,7 @@ export const createServer = (
     toolContext,
     android,
     wasmArtifact,
+    apkSignature,
     evmInterface,
     jeb,
     firmwareAnalysis,
@@ -647,6 +657,7 @@ const registerConfiguredAnalysisTools = (
   }: ServerToolContext,
   android: AndroidAnalysisPort,
   wasmArtifact: Pick<WasmArtifactService, "inspect" | "close">,
+  apkSignature: Pick<ApkSignatureService, "inspect" | "close">,
   evmInterface: EvmInterfaceService,
   jeb: JebAnalysisPort,
   firmwareAnalysis: FirmwareAnalysisService,
@@ -710,6 +721,13 @@ const registerConfiguredAnalysisTools = (
     recordEvidence,
     withAdmittedAnalysis,
     evidenceById,
+  );
+  registerApkSignatureTools(
+    server,
+    apkSignature,
+    toolLogger,
+    recordEvidence,
+    withAdmittedAnalysis,
   );
   registerEvmTools(
     server,
