@@ -178,6 +178,8 @@ export interface InstalledSkillIdentity {
   readonly version: string | null;
   readonly toolCount: number | null;
   readonly canonical: boolean;
+  /** No skill manifest bytes were readable; retained files keep this identity. */
+  readonly manifestMissing?: true;
   readonly issues?: readonly SkillPathIssue[];
 }
 
@@ -362,6 +364,7 @@ interface CanonicalSkillInspection {
   readonly canonical: boolean;
   readonly manifest: string | undefined;
   readonly installedDestination: boolean;
+  readonly retainedManagedFiles: boolean;
 }
 
 interface SkillInspectionFailure {
@@ -399,6 +402,7 @@ const inspectCanonicalSkill = async (
   let manifest: string | undefined;
   let failureCause: unknown;
   let installedDestination = false;
+  let retainedManagedFiles = false;
   for (const destination of destinations) {
     const { path: root } = destination;
     const pathIssues =
@@ -446,12 +450,13 @@ const inspectCanonicalSkill = async (
     }
     if (clientIds !== undefined || rootHasFiles || rootIssues.length > 0) {
       installedDestination = true;
+      retainedManagedFiles = retainedManagedFiles || rootHasFiles;
       canonical = canonical && rootCanonical;
       issues.push(...rootIssues);
     }
   }
   return issues.length === 0
-    ? ok({ canonical, manifest, installedDestination })
+    ? ok({ canonical, manifest, installedDestination, retainedManagedFiles })
     : err({
         _tag: "SkillInspectionFailure",
         issues,
@@ -646,13 +651,19 @@ export const readInstalledSkillIdentity = async (
     ? inspection.value.manifest
     : inspection.error.manifest;
   const issues = inspection.ok ? [] : inspection.error.issues;
-  if (content === undefined && issues.length === 0) return undefined;
+  const retainedManagedFiles =
+    inspection.ok && inspection.value.retainedManagedFiles;
+  // Retained managed files without a readable manifest keep a noncanonical
+  // identity with unavailable metadata; an empty destination stays absent.
+  if (content === undefined && issues.length === 0 && !retainedManagedFiles)
+    return undefined;
   const toolCount =
     content === undefined
       ? undefined
       : /^\s{2}tool_count:\s*(\d+)\s*$/mu.exec(content)?.[1];
   return {
     canonical: inspection.ok && inspection.value.canonical,
+    ...(content === undefined ? { manifestMissing: true } : {}),
     version:
       content === undefined
         ? null

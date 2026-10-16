@@ -152,6 +152,7 @@ export type DoctorSkillState =
   | "aligned"
   | "stale"
   | "missing"
+  | "partial"
   | "unmanaged"
   | "unknown";
 
@@ -379,11 +380,11 @@ const skillIdentityState = (
   if (identity?.issues?.some(({ kind }) => kind === "unreadable"))
     return "unknown";
   if ((identity?.issues?.length ?? 0) > 0) return "unmanaged";
-  return identity === undefined
-    ? "missing"
-    : skillIdentityAligned(identity)
-      ? "aligned"
-      : "stale";
+  if (identity === undefined) return "missing";
+  // Retained managed files without manifest bytes are partial: present and
+  // noncanonical, without a manifest to report as a known stale version.
+  if (identity.manifestMissing) return "partial";
+  return skillIdentityAligned(identity) ? "aligned" : "stale";
 };
 
 const skillIdentityRemediation = (
@@ -408,7 +409,9 @@ const skillIdentityCheck = (
         ? `Selected skill identity is ${skillIdentityState(identity)}: ${issues.map(({ path }) => path).join(", ")}.`
         : identity === undefined
           ? "Installed REA skill identity is missing."
-          : "Installed REA skill identity is stale.",
+          : identity.manifestMissing
+            ? "Installed REA skill files are present without a readable skill manifest."
+            : "Installed REA skill identity is stale.",
     remediation: skillIdentityRemediation(identity),
   };
 };
