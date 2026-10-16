@@ -871,19 +871,41 @@ const electronRequireOrigin = (
 const bindingOrigin = (
   binding: JavaScriptSemanticBindingState,
   state: JavaScriptSemanticAnalysisState,
+  visited: Set<string> = new Set(),
 ): JavaScriptModuleOrigin | undefined => {
+  if (visited.has(binding.bindingId)) return undefined;
+  visited.add(binding.bindingId);
   if (binding.directOrigins.length > 0)
     return binding.directOrigins.length === 1
       ? binding.directOrigins[0]
       : undefined;
   const initializer = semanticStableInitializer(binding, state);
   if (initializer === undefined) return undefined;
-  const origin = electronRequireOrigin(initializer.node, state)?.origin;
   const projection = initializer.projection;
-  return origin === undefined ||
-    !projection.every((key): key is string => typeof key === "string")
-    ? undefined
-    : { ...origin, importedPath: [...origin.importedPath, ...projection] };
+  if (!projection.every((key): key is string => typeof key === "string"))
+    return undefined;
+  const directOrigin = electronRequireOrigin(initializer.node, state)?.origin;
+  if (directOrigin !== undefined)
+    return {
+      ...directOrigin,
+      importedPath: [...directOrigin.importedPath, ...projection],
+    };
+  if (t.isIdentifier(initializer.node)) {
+    const targetBinding = resolveSemanticBindingState(
+      state,
+      initializer.node,
+      initializer.node.name,
+    );
+    if (targetBinding !== undefined) {
+      const parentOrigin = bindingOrigin(targetBinding, state, visited);
+      if (parentOrigin !== undefined)
+        return {
+          ...parentOrigin,
+          importedPath: [...parentOrigin.importedPath, ...projection],
+        };
+    }
+  }
+  return undefined;
 };
 
 const createState = (
