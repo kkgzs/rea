@@ -114,6 +114,13 @@ export interface ArtifactReaderTraversal {
 /** Per-iterator observation sink; adapters report intentional omissions without shared state. */
 export interface ArtifactTraversalOptions {
   readonly onOmission?: (omission: ArtifactTraversalOmission) => void;
+  /**
+   * Entries the caller may later `open()`. A reader that keeps per-entry state
+   * for opening (a ZIP keeps each decoded central-directory record) retains it
+   * only for these, so enumerating a huge archive costs memory proportional to
+   * what the caller selects. Omitted: every entry stays openable.
+   */
+  readonly retain?: (entry: ArtifactEntry) => boolean;
 }
 
 /** Read-only adapter over one directory, archive, or virtual container. */

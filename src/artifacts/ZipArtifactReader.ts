@@ -32,8 +32,10 @@ import {
   sameArtifactEntry,
   type ArtifactEntry,
   type ArtifactReader,
+  type ArtifactTraversalOptions,
 } from "./ArtifactReader.js";
 import type { ZipPackageFormat } from "../domain/zipPackageFormat.js";
+import { normalizeArchiveMemberPath } from "../domain/archiveMemberPath.js";
 import {
   ARTIFACT_DECOMPRESSION_RATIO,
   artifactDecompressionBudgetBytes,
@@ -187,7 +189,10 @@ export class ZipArtifactReader implements ArtifactReader {
     });
   }
 
-  async *entries(signal?: AbortSignal): AsyncIterable<ArtifactEntry> {
+  async *entries(
+    signal?: AbortSignal,
+    options?: ArtifactTraversalOptions,
+  ): AsyncIterable<ArtifactEntry> {
     let index = 0;
     // A traversal owns its accounting, including overlapping or repeated passes.
     let declaredFileBytes = 0;
@@ -221,7 +226,9 @@ export class ZipArtifactReader implements ArtifactReader {
           "integrity",
           `ZIP member identity changed during enumeration: ${entry.filename}`,
         );
-      if (stored === undefined)
+      // A decoded record costs ~8 KB; keep it only for entries the caller may
+      // open (unretained entries cannot be opened from this reader).
+      if (stored === undefined && (options?.retain?.(metadata) ?? true))
         this.#entries.set(metadata.adapterKey, {
           source: entry,
           metadata: copyArtifactEntry(metadata),
@@ -276,7 +283,7 @@ const projectZipEntry = (
       ? "directory"
       : "file";
   const sourcePath = zipEntryPath(entry);
-  const path = sourcePath.replace(/^(?:\.\/)+/u, "");
+  const path = normalizeArchiveMemberPath(sourcePath);
   // Root directory markers carry no inventory occurrence. A file with this
   // spelling is still passed to the shared path validator and rejected there.
   if (kind === "directory" && (path === "" || path === ".")) return undefined;
