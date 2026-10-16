@@ -130,7 +130,10 @@ The final selected directories are checked before approval and again before
 setup changes any client or Hopper installation. Unselected client destinations
 do not block other setup choices. Doctor reports linked or non-directory skill
 paths as `unmanaged`, names the affected paths, and provides those alternatives;
-an unreadable skill identity remains `unknown`. Uninstall retains and reports
+an unreadable skill identity remains `unknown`. A destination that retains
+managed files without a readable `SKILL.md` reports `partial` instead of
+`missing`, keeping a partial installation visible until the next setup
+refresh. Uninstall retains and reports
 files it cannot safely remove, including their ownership manifest.
 
 `rea setup --skill-client claude_code --yes --json` refreshes and verifies the
