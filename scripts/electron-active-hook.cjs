@@ -1,5 +1,8 @@
 "use strict";
 
+const applyFunction = Reflect.apply;
+
+const { isProxy } = require("node:util").types;
 const {
   createElectronActiveBoundaryPatches,
 } = require("./electron-active-hook-boundaries.cjs");
@@ -343,43 +346,159 @@ const recordInvocation = (kind, channel, event, args) =>
     error: false,
   });
 
+const invokeObservedEventListener = (thisArg, channel, listener, args) => {
+  const recorded = recordInvocation(
+    "main-event-invocation",
+    channel,
+    args[0],
+    args.slice(1),
+  );
+  try {
+    return listener.apply(thisArg, args);
+  } catch (cause) {
+    if (recorded !== null) recorded.error = true;
+    throw cause;
+  }
+};
+
+// Recording wrappers follow EventEmitter's own wrapper convention: `.listener`
+// names the caller's function so native removal can match it. Node retains
+// ownership of listener traversal and meta-events; hook-created "on" entries
+// are translated before calling the application's removal method/decorators.
+// Only hook-created wrappers are tracked, by the registration they stand in
+// for: they already record, so patched on() registers them as is. An "on"
+// wrapper stands in for the caller's raw function and a "once" wrapper for
+// EventEmitter's once wrapper, which removeAllListeners reports accordingly.
+// The value is the native removal argument: the app function for an "on"
+// wrapper, or the wrapper itself for "once". Public .listener is mutable;
+// it is not the authority for the original function's identity.
+const hookListenerRemovalTargets = new WeakMap();
+const MAX_LISTENER_CHAIN_HOPS = 16;
+
+// A decorator that wraps once's hook wrapper and names it through `.listener`
+// already records through that wrapper. Registering the decorator as is keeps
+// native self-removal working: the once wrapper removes itself by identity, and
+// removeListener matches the decorator through its `.listener`.
+const reachesHookListenerWrapper = (listener) => {
+  const visited = new Set();
+  let candidate = listener;
+  for (
+    let hops = 0;
+    hops <= MAX_LISTENER_CHAIN_HOPS &&
+    typeof candidate === "function" &&
+    !visited.has(candidate);
+    hops += 1
+  ) {
+    if (hookListenerRemovalTargets.has(candidate)) return true;
+    visited.add(candidate);
+    // Proxy reflection can run application traps; ordinary own descriptors
+    // expose data links without evaluating application-owned accessors.
+    if (isProxy(candidate)) return false;
+    candidate = Object.getOwnPropertyDescriptor(candidate, "listener")?.value;
+  }
+  return false;
+};
+
 const patchIpcMain = (ipcMain) => {
   if (ipcMain === null || ipcMain === undefined) return;
-  for (const [method, kind] of [
-    ["handle", "main-handler-invocation"],
-    ["on", "main-event-invocation"],
-    ["once", "main-event-invocation"],
-  ]) {
-    const original = ipcMain[method];
-    if (typeof original !== "function") continue;
-    ipcMain[method] = function patchedIpcMain(channel, listener) {
+  const { handle, on, once, removeAllListeners } = ipcMain;
+  if (typeof handle === "function")
+    ipcMain.handle = function patchedIpcMainHandle(channel, listener) {
       if (typeof listener !== "function")
-        return original.call(this, channel, listener);
-      const wrapped =
-        kind === "main-handler-invocation"
-          ? async function wrappedHandler(event, ...args) {
-              const recorded = recordInvocation(kind, channel, event, args);
-              try {
-                const result = await listener.call(this, event, ...args);
-                if (recorded !== null) recorded.result_shape = shape(result);
-                return result;
-              } catch (cause) {
-                if (recorded !== null) recorded.error = true;
-                throw cause;
-              }
-            }
-          : function wrappedEventListener(event, ...args) {
-              const recorded = recordInvocation(kind, channel, event, args);
-              try {
-                return listener.call(this, event, ...args);
-              } catch (cause) {
-                if (recorded !== null) recorded.error = true;
-                throw cause;
-              }
-            };
-      return original.call(this, channel, wrapped);
+        return handle.call(this, channel, listener);
+      return handle.call(
+        this,
+        channel,
+        async function wrappedHandler(event, ...args) {
+          const recorded = recordInvocation(
+            "main-handler-invocation",
+            channel,
+            event,
+            args,
+          );
+          try {
+            const result = await applyFunction(listener, this, arguments);
+            if (recorded !== null) recorded.result_shape = shape(result);
+            return result;
+          } catch (cause) {
+            if (recorded !== null) recorded.error = true;
+            throw cause;
+          }
+        },
+      );
     };
-  }
+  if (typeof on !== "function") return;
+  ipcMain.on = function patchedIpcMainOn(channel, listener) {
+    if (typeof listener !== "function" || reachesHookListenerWrapper(listener))
+      return on.call(this, channel, listener);
+    const wrapped = function wrappedEventListener(...args) {
+      return invokeObservedEventListener(this, channel, listener, args);
+    };
+    wrapped.listener = listener;
+    hookListenerRemovalTargets.set(wrapped, listener);
+    return on.call(this, channel, wrapped);
+  };
+  // Mirror EventEmitter#once and _onceWrap: resolve this.on at registration
+  // and target.removeListener at firing, so later decorators observe both.
+  if (typeof once === "function")
+    ipcMain.once = function patchedIpcMainOnce(channel, listener) {
+      if (typeof listener !== "function")
+        return once.call(this, channel, listener);
+      const target = this;
+      let fired = false;
+      const wrapped = function wrappedOnceEventListener(...args) {
+        if (fired) return undefined;
+        target.removeListener(channel, wrapped);
+        fired = true;
+        return invokeObservedEventListener(target, channel, listener, args);
+      };
+      wrapped.listener = listener;
+      hookListenerRemovalTargets.set(wrapped, wrapped);
+      this.on(channel, wrapped);
+      return this;
+    };
+  if (typeof removeAllListeners !== "function") return;
+  // Node owns its live-array traversal. A forwarding receiver translates only
+  // our "on" entries before calling the current application removal method,
+  // including decorators installed/replaced during traversal. Application
+  // getters and methods always receive the real emitter; its public methods
+  // are never temporarily replaced. Native once entries remain unchanged.
+  ipcMain.removeAllListeners = function patchedIpcMainRemoveAllListeners(
+    ...args
+  ) {
+    const emitter = this;
+    // A separate empty target also permits forwarding a non-writable app
+    // method; a Proxy of the emitter itself would violate get invariants.
+    const receiver = new Proxy(Object.create(null), {
+      get(_target, key) {
+        const value = Reflect.get(emitter, key, emitter);
+        if (
+          (key !== "removeListener" && key !== "removeAllListeners") ||
+          typeof value !== "function"
+        )
+          return value;
+        return (...methodArgs) => {
+          if (key === "removeListener") {
+            const entry = methodArgs[1];
+            const removalTarget = hookListenerRemovalTargets.get(entry);
+            // Translate only a still-valid data link. If app code changed it
+            // to an accessor, native removal owns when that getter executes.
+            if (
+              removalTarget !== undefined &&
+              removalTarget !== entry &&
+              Object.getOwnPropertyDescriptor(entry, "listener")?.value ===
+                removalTarget
+            )
+              methodArgs[1] = removalTarget;
+          }
+          return applyFunction(value, emitter, methodArgs);
+        };
+      },
+      set: (_target, key, value) => Reflect.set(emitter, key, value, emitter),
+    });
+    const result = applyFunction(removeAllListeners, receiver, args);
+    return result === receiver ? emitter : result;
+  };
 };
 
 const patchNavigationMethods = (webContents, contentsId) => {
