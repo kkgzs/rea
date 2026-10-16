@@ -113,7 +113,14 @@ export class PlaywrightElectronActiveProvider implements ElectronActiveObservati
         executablePath: paths.executable,
         cwd: paths.root,
         env: safeElectronEnvironment(this.environment, runId),
-        args: ["-r", hookPath, paths.application, ...input.args],
+        args: [
+          "-r",
+          hookPath,
+          ...(paths.executable === paths.application
+            ? []
+            : [paths.application]),
+          ...input.args,
+        ],
         timeout: Math.max(1, startupDeadline - performance.now()),
       };
       application = await containLaunchRejections(() =>

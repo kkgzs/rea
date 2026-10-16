@@ -1,12 +1,13 @@
 import { access, chmod, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { STDIO_DEFAULT_MAX_BUFFER_SIZE } from "@modelcontextprotocol/server";
 
 import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { firmwareResultSchemas } from "../../../src/domain/firmware/firmwareAnalysis.js";
 import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
+import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 import { ToolResultDelivery } from "../../../src/server/toolResult.js";
 import {
   assertFirmwareCleanup,
@@ -158,6 +159,59 @@ it.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
       if (workspace !== undefined)
         await chmod(join(workspace, "cleanup-blocked"), 0o700);
       await fixture.close();
+    }
+    await assertFirmwareCleanup(fixture.launches);
+  },
+);
+
+it.skipIf(process.platform !== "linux")(
+  "retains completed inspection result and retries descriptor cleanup when report close fails",
+  async () => {
+    const fixture = await firmwareFixture("normal");
+    let closeCount = 0;
+    const originalClose = OwnedFileHandle.prototype.close;
+    const closeSpy = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockImplementation(async function (this: OwnedFileHandle) {
+        closeCount += 1;
+        // Fail on the 3rd close (report read handle)
+        if (closeCount === 3) {
+          throw new Error("injected report close failure");
+        }
+        return await originalClose.call(this);
+      });
+
+    try {
+      const outcome = await fixture.service.execute(
+        "inspect_firmware_regions",
+        {
+          path: fixture.path,
+        },
+      );
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) throw new Error("Expected failure");
+      expect(outcome.error.cleanupIncomplete).toBe(true);
+      expect(outcome.error.cleanupResources).toContainEqual(
+        expect.stringContaining("report.json"),
+      );
+
+      const partial = outcome.error.partialObservation;
+      expect(partial).toBeDefined();
+      if (partial === undefined || !("result" in partial)) {
+        throw new Error("Expected partial observation result");
+      }
+      const parsed = firmwareResultSchemas.inspect_firmware_regions.parse(
+        partial.result,
+      );
+      expect(parsed.regions.length).toBeGreaterThan(0);
+
+      // Now restore spy so that retrying close cleans up the descriptor
+      closeSpy.mockRestore();
+
+      await expect(fixture.close()).resolves.toBeUndefined();
+    } finally {
+      closeSpy.mockRestore();
+      await fixture.close().catch(() => {});
     }
     await assertFirmwareCleanup(fixture.launches);
   },

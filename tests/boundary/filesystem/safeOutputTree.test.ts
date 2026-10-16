@@ -15,7 +15,7 @@ import {
 import { join } from "node:path";
 import { Readable } from "node:stream";
 
-import { describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, vi } from "vitest";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
@@ -276,6 +276,33 @@ describe("safe artifact output tree identity", () => {
       expect(await readFile(outside, "utf8")).toBe("outside bytes");
     },
   );
+
+  it("rejects readback when cancelled with exact caller reason", async () => {
+    const parent = await createTestTempDirectory(
+      "rea-safe-output-cancellation-",
+    );
+    const output = join(parent, "published");
+    const tree = await SafeOutputTree.create(output);
+    const bytes = Buffer.from("test bytes");
+    const controller = new AbortController();
+    const abortReason = new Error("custom caller abort reason");
+    controller.abort(abortReason);
+    const failure = await tree
+      .write(
+        "file.txt",
+        Readable.from(bytes),
+        {
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          bytes: bytes.byteLength,
+        },
+        controller.signal,
+      )
+      .catch((cause: unknown) => cause);
+    assert(failure instanceof ArtifactReaderFailure);
+    expect(failure.reason).toBe("cancelled");
+    expect(failure.cause).toBe(abortReason);
+    await tree.rollback();
+  });
 });
 
 it("retains an untracked regular entry and retries after it is removed", async () => {

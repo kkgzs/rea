@@ -29,6 +29,18 @@ describe("Electron identity through Webpack externals", () => {
     expect(electron.ipc).toMatchObject([{ channel: "ready", side: "main" }]);
   });
 
+  it("follows destructured Electron members from an external module binding", () => {
+    const source = bootstrap(
+      EXTERNAL,
+      'const s=n(45840);const { BrowserWindow, ipcMain } = s;new BrowserWindow({webPreferences:{preload:"./preload.js",contextIsolation:!1}});ipcMain.handle("get-connections",async()=>[]);',
+    );
+    const electron = electronOf(source);
+    expect(electron.browser_windows).toHaveLength(1);
+    expect(electron.ipc).toMatchObject([
+      { channel: "get-connections", side: "main" },
+    ]);
+  });
+
   it.each([
     [
       "a fake getter",

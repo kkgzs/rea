@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants } from "node:fs";
-import { lstat, open, readlink, realpath } from "node:fs/promises";
+import { lstat, readlink, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 
 import { AnalysisInputError } from "../../domain/analysisErrorCore.js";
@@ -16,9 +15,16 @@ import {
 } from "../../domain/apple/dylibResolution.js";
 import { projectInputIssues } from "../../domain/inputIssueProjection.js";
 import { ArtifactReaderFailure } from "../ArtifactReader.js";
+import type { ArtifactResourceScope } from "../ArtifactResourceScope.js";
 import { DirectoryArtifactReader } from "../DirectoryArtifactReader.js";
 import { consumeWithOrderedReads } from "../OrderedReads.js";
 import { hasMachoMagic, readMachoImage } from "./MachoLoadCommandReader.js";
+import {
+  withOwnedRegularFile,
+  RegularFileCancelled,
+  RegularFileCleanupFailure,
+} from "../../filesystem/OwnedRegularFile.js";
+import { NonRegularFileReadError } from "../../filesystem/RegularFile.js";
 
 const OPERATION = "trace_dylib_resolution";
 const HASH_CHUNK_BYTES = 1024 * 1024;
@@ -37,6 +43,7 @@ class FilesystemTreeView implements DylibTreeView {
   constructor(
     private readonly root: string,
     private readonly signal?: AbortSignal,
+    private readonly resourceScope?: ArtifactResourceScope,
   ) {}
 
   entry(path: string): Promise<DylibTreeEntry | undefined> {
@@ -50,12 +57,14 @@ class FilesystemTreeView implements DylibTreeView {
   image(path: string): Promise<MachoImageFacts> {
     const cached = this.#images.get(path);
     if (cached !== undefined) return cached;
-    const pending = readImage(join(this.root, path), this.signal).then(
-      ({ facts, identity }) => {
-        this.#identities.set(path, identity);
-        return facts;
-      },
-    );
+    const pending = readImage(
+      join(this.root, path),
+      this.signal,
+      this.resourceScope,
+    ).then(({ facts, identity }) => {
+      this.#identities.set(path, identity);
+      return facts;
+    });
     this.#images.set(path, pending);
     return pending;
   }
@@ -88,6 +97,7 @@ export const traceDylibResolution = async (options: {
   readonly targetSha256: string;
   readonly enumerateRoots: boolean;
   readonly parameters: unknown;
+  readonly resourceScope?: ArtifactResourceScope;
   readonly signal?: AbortSignal;
 }): Promise<DylibResolutionResult> => {
   const parsed = dylibResolutionInputSchema.safeParse(options.parameters);
@@ -105,12 +115,21 @@ export const traceDylibResolution = async (options: {
     const target = relative(root, await realpath(options.targetPath))
       .split(sep)
       .join("/");
-    const view = new FilesystemTreeView(root, options.signal);
+    const view = new FilesystemTreeView(
+      root,
+      options.signal,
+      options.resourceScope,
+    );
     const { roots: requested, unclassified } =
       parsed.data.roots !== undefined
         ? { roots: parsed.data.roots, unclassified: [] }
         : options.enumerateRoots
-          ? await executableRoots(root, view, options.signal)
+          ? await executableRoots(
+              root,
+              view,
+              options.signal,
+              options.resourceScope,
+            )
           : { roots: [target], unclassified: [] };
     const roots = await requireMachoRoots(
       view,
@@ -133,6 +152,9 @@ export const traceDylibResolution = async (options: {
         await fileSha256(join(root, path), {
           path,
           expected: view.identity(path),
+          ...(options.resourceScope === undefined
+            ? {}
+            : { resourceScope: options.resourceScope }),
           ...(options.signal === undefined ? {} : { signal: options.signal }),
         }),
       );
@@ -141,6 +163,9 @@ export const traceDylibResolution = async (options: {
       (await fileSha256(join(root, target), {
         path: target,
         expected: undefined,
+        ...(options.resourceScope === undefined
+          ? {}
+          : { resourceScope: options.resourceScope }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       }));
     if (targetDigest !== options.targetSha256)
@@ -158,12 +183,25 @@ export const traceDylibResolution = async (options: {
       })),
     });
   } catch (cause: unknown) {
-    if (options.signal?.aborted === true)
+    if (isCancellationError(cause, options.signal))
       throw new ArtifactReaderFailure(
         "cancelled",
         "Dylib resolution was cancelled",
-        { cause },
+        { cause: options.signal?.reason ?? cause },
       );
+    if (cause instanceof RegularFileCleanupFailure) {
+      const primary =
+        cause.outcome.kind === "failed"
+          ? cause.outcome.cause
+          : new ArtifactReaderFailure("unavailable", cause.message, { cause });
+      throw ArtifactReaderFailure.withCleanup(
+        primary,
+        ArtifactReaderFailure.cleanupObservation(
+          cause.cleanupCause,
+          cause.path,
+        ),
+      );
+    }
     const denied = permissionDenied(cause);
     if (denied !== undefined)
       throw new ArtifactReaderFailure(
@@ -184,6 +222,7 @@ const executableRoots = async (
   root: string,
   view: FilesystemTreeView,
   signal?: AbortSignal,
+  resourceScope?: ArtifactResourceScope,
 ): Promise<{ readonly roots: string[]; readonly unclassified: string[] }> => {
   const roots: string[] = [];
   const unclassified: string[] = [];
@@ -194,7 +233,7 @@ const executableRoots = async (
     MAGIC_READ_CONCURRENCY,
     (entry) =>
       entry.kind === "file"
-        ? startsWithMachoMagic(entry.adapterKey)
+        ? startsWithMachoMagic(entry.adapterKey, signal, resourceScope)
         : undefined,
     async (entry, macho) => {
       if (!macho) return;
@@ -254,14 +293,35 @@ const requireMachoRoots = async (
   return resolved;
 };
 
-const startsWithMachoMagic = async (path: string): Promise<boolean> => {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+const startsWithMachoMagic = async (
+  path: string,
+  signal?: AbortSignal,
+  resourceScope?: ArtifactResourceScope,
+): Promise<boolean> => {
   try {
-    const buffer = new Uint8Array(4);
-    const { bytesRead } = await handle.read(buffer, 0, 4, 0);
-    return hasMachoMagic(buffer.subarray(0, bytesRead));
-  } finally {
-    await handle.close();
+    return await withOwnedRegularFile(
+      path,
+      {
+        symlinks: "reject",
+        ...(signal === undefined ? {} : { signal }),
+        retainFailedClose: (owner) => {
+          resourceScope?.retain({
+            kind: "file-handle",
+            resource: path,
+            handle: owner,
+          });
+        },
+      },
+      async (handle) => {
+        const buffer = new Uint8Array(4);
+        const { bytesRead } = await handle.read(buffer, 0, 4, 0);
+        return hasMachoMagic(buffer.subarray(0, bytesRead));
+      },
+    );
+  } catch (cause: unknown) {
+    if (cause instanceof NonRegularFileReadError) return false;
+    if (missing(cause)) return false;
+    throw cause;
   }
 };
 
@@ -283,26 +343,58 @@ const identityOf = (metadata: {
 const readImage = async (
   path: string,
   signal?: AbortSignal,
+  resourceScope?: ArtifactResourceScope,
 ): Promise<{
   readonly facts: MachoImageFacts;
   readonly identity: FileIdentity;
 }> => {
   cancelled(signal);
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const metadata = await handle.stat({ bigint: true });
-    const size = Number(metadata.size);
-    const facts = await readMachoImage(async (offset, length) => {
-      cancelled(signal);
-      const buffer = new Uint8Array(
-        Math.max(0, Math.min(length, size - offset)),
-      );
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
-      return buffer.subarray(0, bytesRead);
-    }, size);
-    return { facts, identity: identityOf(metadata) };
-  } finally {
-    await handle.close();
+    return await withOwnedRegularFile(
+      path,
+      {
+        symlinks: "reject",
+        ...(signal === undefined ? {} : { signal }),
+        retainFailedClose: (owner) => {
+          resourceScope?.retain({
+            kind: "file-handle",
+            resource: path,
+            handle: owner,
+          });
+        },
+      },
+      async (handle) => {
+        cancelled(signal);
+        const metadata = await handle.stat({ bigint: true });
+        if (!metadata.isFile())
+          return {
+            facts: { status: "not-mach-o" },
+            identity: identityOf(metadata),
+          };
+        const size = Number(metadata.size);
+        const facts = await readMachoImage(async (offset, length) => {
+          cancelled(signal);
+          const buffer = new Uint8Array(
+            Math.max(0, Math.min(length, size - offset)),
+          );
+          const { bytesRead } = await handle.read(
+            buffer,
+            0,
+            buffer.length,
+            offset,
+          );
+          return buffer.subarray(0, bytesRead);
+        }, size);
+        return { facts, identity: identityOf(metadata) };
+      },
+    );
+  } catch (cause: unknown) {
+    if (cause instanceof NonRegularFileReadError)
+      return {
+        facts: { status: "not-mach-o" },
+        identity: "",
+      };
+    throw cause;
   }
 };
 
@@ -313,38 +405,75 @@ const fileSha256 = async (
     readonly path: string;
     readonly expected: FileIdentity | undefined;
     readonly signal?: AbortSignal;
+    readonly resourceScope?: ArtifactResourceScope;
   },
 ): Promise<string> => {
-  const { signal } = options;
-  const handle = await open(
+  const { signal, resourceScope } = options;
+  return await withOwnedRegularFile(
     absolute,
-    constants.O_RDONLY | constants.O_NOFOLLOW,
+    {
+      symlinks: "reject",
+      ...(signal === undefined ? {} : { signal }),
+      retainFailedClose: (owner) => {
+        resourceScope?.retain({
+          kind: "file-handle",
+          resource: absolute,
+          handle: owner,
+        });
+      },
+    },
+    async (handle) => {
+      const metadata = await handle.stat({ bigint: true });
+      if (!metadata.isFile())
+        throw new ArtifactReaderFailure(
+          "integrity",
+          `${options.path} is not a regular file`,
+        );
+      if (
+        options.expected !== undefined &&
+        identityOf(metadata) !== options.expected
+      )
+        throw new ArtifactReaderFailure(
+          "integrity",
+          `${options.path} changed while its dyld load commands were traced`,
+        );
+      const hash = createHash("sha256");
+      const buffer = new Uint8Array(HASH_CHUNK_BYTES);
+      for (;;) {
+        cancelled(signal);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        if (bytesRead === 0) break;
+        hash.update(buffer.subarray(0, bytesRead));
+      }
+      const postStat = await handle.stat({ bigint: true });
+      if (
+        options.expected !== undefined &&
+        identityOf(postStat) !== options.expected
+      )
+        throw new ArtifactReaderFailure(
+          "integrity",
+          `${options.path} changed while its dyld load commands were traced`,
+        );
+      return hash.digest("hex");
+    },
   );
-  const unchanged = async (): Promise<void> => {
-    if (
-      options.expected !== undefined &&
-      identityOf(await handle.stat({ bigint: true })) !== options.expected
-    )
-      throw new ArtifactReaderFailure(
-        "integrity",
-        `${options.path} changed while its dyld load commands were traced`,
-      );
-  };
-  try {
-    await unchanged();
-    const hash = createHash("sha256");
-    const buffer = new Uint8Array(HASH_CHUNK_BYTES);
-    for (;;) {
-      cancelled(signal);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-    }
-    await unchanged();
-    return hash.digest("hex");
-  } finally {
-    await handle.close();
-  }
+};
+
+const isCancellationError = (cause: unknown, signal?: AbortSignal): boolean => {
+  if (
+    signal?.aborted === true &&
+    (cause === undefined || cause === signal.reason)
+  )
+    return true;
+  if (cause instanceof RegularFileCancelled) return true;
+  if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+    return true;
+  if (
+    cause instanceof Error &&
+    (cause.name === "AbortError" || cause.message.includes("aborted"))
+  )
+    return true;
+  return false;
 };
 
 const cancelled = (signal?: AbortSignal): void => {
@@ -352,6 +481,7 @@ const cancelled = (signal?: AbortSignal): void => {
     throw new ArtifactReaderFailure(
       "cancelled",
       "Dylib resolution was cancelled",
+      { cause: signal.reason },
     );
 };
 

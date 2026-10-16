@@ -315,6 +315,7 @@ class ArtifactClient implements AnalysisClient {
       targetSha256: this.target.sha256,
       enumerateRoots: bundle !== undefined,
       parameters,
+      resourceScope: this.#resourceScope,
       ...(options?.signal === undefined ? {} : { signal: options.signal }),
     });
     return ok(

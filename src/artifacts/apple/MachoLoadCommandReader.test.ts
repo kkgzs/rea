@@ -672,3 +672,59 @@ it.each([true, false])(
     });
   },
 );
+
+it.skipIf(process.platform === "win32")(
+  "does not block on a named pipe when tracing dylibs and ignores it",
+  async () => {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const root = await createTestTempDirectory("rea-macho-fifo-");
+    const execPath = join(root, "app");
+    const fifoPath = join(root, "pipe.dylib");
+    await promisify(execFile)("mkfifo", [fifoPath]);
+    const execBytes = machoImage({
+      cpu: CPU.arm64,
+      commands: [dylibCommand(LC.LOAD_DYLIB, "@executable_path/pipe.dylib")],
+    });
+    await writeFile(execPath, execBytes);
+    const targetSha256 = createHash("sha256").update(execBytes).digest("hex");
+    const result = await traceDylibResolution({
+      rootPath: root,
+      targetPath: execPath,
+      targetSha256,
+      enumerateRoots: false,
+      parameters: {},
+    });
+    expect(result).toBeDefined();
+    expect(result.images.some((img) => img.path === "pipe.dylib")).toBe(false);
+  },
+);
+
+it("preserves exact cancellation reason when signal is aborted during resolution", async () => {
+  const root = await createTestTempDirectory("rea-macho-cancel-");
+  const execPath = join(root, "app");
+  const execBytes = machoImage({
+    cpu: CPU.arm64,
+  });
+  await writeFile(execPath, execBytes);
+  const targetSha256 = createHash("sha256").update(execBytes).digest("hex");
+  const controller = new AbortController();
+  const cancelReason = new Error("Custom dyld abort");
+  controller.abort(cancelReason);
+
+  const failure = await traceDylibResolution({
+    rootPath: root,
+    targetPath: execPath,
+    targetSha256,
+    enumerateRoots: false,
+    parameters: {},
+    signal: controller.signal,
+  }).catch((cause: unknown) => cause);
+
+  const { ArtifactReaderFailure } = await import("../ArtifactReader.js");
+  expect(failure).toBeInstanceOf(ArtifactReaderFailure);
+  if (failure instanceof ArtifactReaderFailure) {
+    expect(failure.reason).toBe("cancelled");
+    expect(failure.cause).toBe(cancelReason);
+  }
+});

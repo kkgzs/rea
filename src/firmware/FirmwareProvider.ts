@@ -26,6 +26,7 @@ import { err, ok } from "../domain/result.js";
 import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import type { ProviderProcessSupervisor } from "../process/ProviderProcess.js";
 import type { SafeOutputTree } from "../artifacts/SafeOutputTree.js";
+import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { publishFirmwareExtraction } from "./FirmwarePublication.js";
 import {
   FIRMWARE_LIMITS,
@@ -50,6 +51,7 @@ type Outcome = Awaited<ReturnType<FirmwareAnalysisPort["execute"]>>;
 interface PendingFirmwareCleanup {
   supervisor?: ProviderProcessSupervisor;
   tree?: SafeOutputTree;
+  readonly descriptors: Map<OwnedFileHandle, string>;
   readonly root: PrivateRuntimeRoot;
   readonly engine: string;
   readonly operation: string;
@@ -106,6 +108,10 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
   #tail: Promise<void> = Promise.resolve();
   #closed = false;
   readonly #pendingCleanup = new Map<string, PendingFirmwareCleanup>();
+  readonly #unrootedDescriptors = new Map<
+    OwnedFileHandle,
+    { path: string; engine: string; operation: string }
+  >();
   constructor(
     readonly environment: Readonly<
       Record<string, string | undefined>
@@ -158,6 +164,21 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
   async #retryCleanup(): Promise<FirmwareCleanupAttempt> {
     const failures: ProviderCleanupError[] = [];
     let processUnverified = false;
+    for (const [owner, info] of this.#unrootedDescriptors) {
+      try {
+        await owner.close();
+        this.#unrootedDescriptors.delete(owner);
+      } catch (cause: unknown) {
+        failures.push(
+          new ProviderCleanupError(
+            info.engine,
+            [info.path],
+            { reason: cause instanceof Error ? cause.message : String(cause) },
+            { operation: info.operation, cause },
+          ),
+        );
+      }
+    }
     for (const [path, pending] of this.#pendingCleanup) {
       try {
         const stopped = await pending.supervisor?.stop();
@@ -186,6 +207,23 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
         );
         continue;
       }
+      for (const [owner, descriptorPath] of pending.descriptors) {
+        try {
+          await owner.close();
+          pending.descriptors.delete(owner);
+        } catch (cause: unknown) {
+          failures.push(
+            new ProviderCleanupError(
+              pending.engine,
+              [descriptorPath],
+              {
+                reason: cause instanceof Error ? cause.message : String(cause),
+              },
+              { operation: pending.operation, cause },
+            ),
+          );
+        }
+      }
       try {
         if (pending.tree !== undefined) {
           await pending.tree.rollback();
@@ -203,7 +241,8 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
       }
       try {
         await pending.root.close();
-        if (pending.tree === undefined) this.#pendingCleanup.delete(path);
+        if (pending.tree === undefined && pending.descriptors.size === 0)
+          this.#pendingCleanup.delete(path);
       } catch (cause: unknown) {
         // A verified stopped process cannot use this root. Keep ownership for
         // later removal without blocking a new operation's disjoint workspace.
@@ -233,16 +272,39 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
         ? deadline
         : AbortSignal.any([options.signal, deadline]);
     let outcome: Outcome;
+    let pending: PendingFirmwareCleanup | undefined;
     try {
       if (signal.aborted) throw new AnalysisCancelledError(request.operation);
       const command = await resolveFirmwareCommand(
         this.environment,
         engineName,
         request.operation,
+        (owner, path) => {
+          this.#unrootedDescriptors.set(owner, {
+            path,
+            engine: engineName,
+            operation: request.operation,
+          });
+        },
       );
       root = await PrivateRuntimeRoot.create({ prefix: "rea-firmware-" });
       const ownedRoot = root;
-      const target = await snapshotFirmware(request, root.path, signal);
+      pending = {
+        root: ownedRoot,
+        engine: engineName,
+        operation: request.operation,
+        descriptors: new Map<OwnedFileHandle, string>(),
+      };
+      const activePending = pending;
+      this.#pendingCleanup.set(ownedRoot.path, pending);
+      const target = await snapshotFirmware(
+        request,
+        root.path,
+        signal,
+        (owner) => {
+          activePending.descriptors.set(owner, request.input.path);
+        },
+      );
       const run = (
         args: readonly string[],
         outputBudget?: { root: string; bytes: number; entries: number },
@@ -256,12 +318,7 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
           environment: this.environment,
           signal,
           retainCleanup: (supervisor) => {
-            this.#pendingCleanup.set(ownedRoot.path, {
-              supervisor,
-              root: ownedRoot,
-              engine: engineName,
-              operation: request.operation,
-            });
+            activePending.supervisor = supervisor;
           },
           ...(this.launcher === undefined ? {} : { launcher: this.launcher }),
           ...(outputBudget === undefined
@@ -294,6 +351,7 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
       const reportPath = join(root.path, "report.json");
       let result: unknown;
       let raw: unknown;
+      let reportCleanupError: ProviderCleanupError | undefined;
       if (request.operation === "inspect_firmware_regions") {
         const processRun = await run([
           "--quiet",
@@ -304,12 +362,29 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
           reportPath,
           target.inputPath,
         ]);
-        const report = await readFirmwareCommandReport({
-          path: reportPath,
-          engine: engineName,
-          operation: request.operation,
-          execution: processRun,
-        });
+        let report: unknown;
+        try {
+          report = await readFirmwareCommandReport({
+            path: reportPath,
+            engine: engineName,
+            operation: request.operation,
+            execution: processRun,
+            signal,
+            retainFailedClose: (owner) =>
+              activePending.descriptors.set(owner, reportPath),
+          });
+        } catch (cause: unknown) {
+          if (
+            cause instanceof ProviderCleanupError &&
+            "completedReport" in cause &&
+            cause.completedReport !== undefined
+          ) {
+            report = cause.completedReport;
+            reportCleanupError = cause;
+          } else {
+            throw cause;
+          }
+        }
         result = firmwareResultSchemas.inspect_firmware_regions.parse({
           engine,
           input_size: target.size,
@@ -353,12 +428,29 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
             entries: request.input.max_output_files,
           },
         );
-        const report = await readFirmwareCommandReport({
-          path: reportPath,
-          engine: engineName,
-          operation: request.operation,
-          execution: processRun,
-        });
+        let report: unknown;
+        try {
+          report = await readFirmwareCommandReport({
+            path: reportPath,
+            engine: engineName,
+            operation: request.operation,
+            execution: processRun,
+            signal,
+            retainFailedClose: (owner) =>
+              activePending.descriptors.set(owner, reportPath),
+          });
+        } catch (cause: unknown) {
+          if (
+            cause instanceof ProviderCleanupError &&
+            "completedReport" in cause &&
+            cause.completedReport !== undefined
+          ) {
+            report = cause.completedReport;
+            reportCleanupError = cause;
+          } else {
+            throw cause;
+          }
+        }
         const normalized = normalizeUnblobReport(report, {
           inputPath: target.inputPath,
           outputRoot,
@@ -386,15 +478,10 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
           engine,
           signal,
           retainCleanup: (tree) => {
-            const pending: PendingFirmwareCleanup = this.#pendingCleanup.get(
-              ownedRoot.path,
-            ) ?? {
-              root: ownedRoot,
-              engine: engineName,
-              operation: request.operation,
-            };
-            pending.tree = tree;
-            this.#pendingCleanup.set(ownedRoot.path, pending);
+            activePending.tree = tree;
+          },
+          retainFailedClose: (owner, entryPath) => {
+            activePending.descriptors.set(owner, entryPath);
           },
         });
         raw = { report, execution: processRun, version_execution: versionRun };
@@ -403,29 +490,33 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
         engineName === "binwalk"
           ? BINWALK_PROVIDER_IDENTITY
           : UNBLOB_PROVIDER_IDENTITY;
-      outcome = ok(
-        createAnalysisExecution(
-          result,
-          { ...catalog, version: admitted.version },
-          {
-            subject: target.subject,
-            rawResult: raw,
-            limitations: [
-              ...limitations,
-              ...(admitted.status === "compatible"
-                ? [admitted.limitation]
-                : []),
-            ],
-            locations: [
-              {
-                kind: "file-offset-range",
-                start: target.selection.offset,
-                end: target.selection.offset + target.selection.length,
-              },
-            ],
-          },
-        ),
+      const execution = createAnalysisExecution(
+        result,
+        { ...catalog, version: admitted.version },
+        {
+          subject: target.subject,
+          rawResult: raw,
+          limitations: [
+            ...limitations,
+            ...(admitted.status === "compatible" ? [admitted.limitation] : []),
+          ],
+          locations: [
+            {
+              kind: "file-offset-range",
+              start: target.selection.offset,
+              end: target.selection.offset + target.selection.length,
+            },
+          ],
+        },
       );
+      if (reportCleanupError !== undefined) {
+        reportCleanupError.retainPartialObservation(
+          completedFirmwareObservation(execution),
+        );
+        outcome = err(reportCleanupError);
+      } else {
+        outcome = ok(execution);
+      }
     } catch (cause: unknown) {
       outcome = err(
         cause instanceof ProviderCleanupError
@@ -461,18 +552,11 @@ export class FirmwareProvider implements FirmwareAnalysisPort {
       outcome,
       engineName,
       request,
+      pending?.descriptors,
     );
-    if (
-      !finished.ok &&
-      finished.error.cleanupIncomplete &&
-      root !== undefined &&
-      !this.#pendingCleanup.has(root.path)
-    )
-      this.#pendingCleanup.set(root.path, {
-        root,
-        engine: engineName,
-        operation: request.operation,
-      });
+    if (finished.ok && root !== undefined) {
+      this.#pendingCleanup.delete(root.path);
+    }
     return finished;
   }
 }
@@ -483,17 +567,41 @@ export const finishFirmwareWorkspace = async (
   outcome: Outcome,
   engineName: string,
   request: FirmwareRequest,
+  descriptors?: Map<OwnedFileHandle, string>,
 ): Promise<Outcome> => {
+  if (outcome.ok && descriptors !== undefined && descriptors.size > 0) {
+    const descriptorPaths = [...descriptors.values()];
+    const cleanup = new ProviderCleanupError(
+      engineName,
+      [
+        ...new Set([
+          ...descriptorPaths,
+          ...(root === undefined ? [] : [root.path]),
+        ]),
+      ],
+      { reason: "A firmware descriptor handle could not be closed" },
+      {
+        operation: request.operation,
+        partialObservation: completedFirmwareObservation(outcome.value),
+      },
+    );
+    return err(cleanup);
+  }
   if (!outcome.ok && outcome.error.cleanupIncomplete) {
-    if (
-      root === undefined ||
-      outcome.error.cleanupResources.includes(root.path)
-    )
-      return outcome;
+    const descriptorPaths =
+      descriptors === undefined ? [] : [...descriptors.values()];
+    const allResources = [
+      ...new Set([
+        ...outcome.error.cleanupResources,
+        ...descriptorPaths,
+        ...(root === undefined ? [] : [root.path]),
+      ]),
+    ];
+    if (root === undefined) return outcome;
     return err(
       new ProviderCleanupError(
         engineName,
-        [...outcome.error.cleanupResources, root.path],
+        allResources,
         outcome.error instanceof ProviderAdapterError
           ? (outcome.error.diagnostics ?? { reason: outcome.error.message })
           : { reason: outcome.error.message },

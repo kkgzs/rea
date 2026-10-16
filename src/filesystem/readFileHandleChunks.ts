@@ -44,7 +44,6 @@ export const readFileHandleChunks = (
     })(),
     {
       objectMode: false,
-      ...(options.signal === undefined ? {} : { signal: options.signal }),
     },
   );
 };

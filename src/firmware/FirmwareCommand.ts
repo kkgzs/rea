@@ -8,8 +8,12 @@ import {
   AnalysisTimeoutError,
   AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
+import { AnalysisError } from "../domain/analysisErrorBase.js";
+import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
+import { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
+import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import {
   spawnOwnedProviderProcess,
   ProviderProcessSupervisor,
@@ -39,11 +43,74 @@ export const firmwareToolUnavailable = (
     userMessage: reason,
   });
 
+/** Preserve the operation's typed failure while attaching descriptor cleanup. */
+export const firmwareFileCleanupError = (
+  failure: RegularFileCleanupFailure,
+  engine: string,
+  operation: string,
+  execution?: {
+    exit_code?: number | null;
+    signal?: string | null;
+    stdout: { bytes: number; text: string };
+    stderr: { bytes: number; text: string };
+  },
+): AnalysisError => {
+  const cleanup = new ProviderCleanupError(
+    engine,
+    [failure.path],
+    {
+      reason:
+        failure.cleanupCause instanceof Error
+          ? failure.cleanupCause.message
+          : String(failure.cleanupCause),
+    },
+    { cause: failure, operation },
+  );
+  if (failure.outcome.kind === "completed") return cleanup;
+  const primaryCause = failure.outcome.cause;
+  let primary: AnalysisError;
+  if (primaryCause instanceof AnalysisError) {
+    primary = primaryCause;
+  } else if (execution?.exit_code === 1) {
+    primary = new ProviderAdapterError(engine, operation, {
+      cause: primaryCause,
+      diagnostics: {
+        reason:
+          "Tool exited 1 without a usable analysis report; inspect stderr for startup, sandbox or dependency failures",
+        report_failure:
+          primaryCause instanceof Error
+            ? primaryCause.message
+            : String(primaryCause),
+        exit_code: 1,
+        signal: execution.signal ?? null,
+        stdout: execution.stdout.text,
+        stderr: execution.stderr.text,
+        stdout_bytes: execution.stdout.bytes,
+        stderr_bytes: execution.stderr.bytes,
+      },
+    });
+  } else {
+    const diagnostics =
+      execution !== undefined
+        ? `stdout (${execution.stdout.bytes} bytes): ${execution.stdout.text}; stderr (${execution.stderr.bytes} bytes): ${execution.stderr.text}`
+        : "";
+    primary = new AnalysisOutputError(
+      operation,
+      diagnostics.length > 0
+        ? `Tool did not produce the expected complete report: ${failure.path}; ${diagnostics}`
+        : `Tool did not produce the expected complete report: ${failure.path}`,
+      { cause: primaryCause },
+    );
+  }
+  return analysisErrorWithCleanupFailure(primary, cleanup, operation);
+};
+
 /** Resolve explicitly supplied executable paths; never install or search for engines. */
 export const resolveFirmwareCommand = async (
   environment: Readonly<Record<string, string | undefined>>,
   engine: "binwalk" | "unblob",
   operation: string,
+  retainFailedClose?: (owner: OwnedFileHandle, path: string) => void,
 ) => {
   const variable =
     engine === "binwalk" ? "REA_BINWALK_COMMAND" : "REA_UNBLOB_COMMAND";
@@ -70,8 +137,13 @@ export const resolveFirmwareCommand = async (
     await access(command, constants.R_OK | constants.X_OK);
     if (!(await stat(command)).isFile())
       throw new TypeError("Configured path is not a regular file");
-    sha256 = await hashFirmwareFile(command);
+    sha256 = await hashFirmwareFile(command, {
+      retainFailedClose: (owner) => retainFailedClose?.(owner, command),
+    });
   } catch (cause: unknown) {
+    if (cause instanceof RegularFileCleanupFailure) {
+      throw firmwareFileCleanupError(cause, engine, operation);
+    }
     throw firmwareToolUnavailable(
       engine,
       operation,
@@ -250,10 +322,29 @@ export const readFirmwareCommandReport = async (context: {
   engine: string;
   operation: string;
   execution: Awaited<ReturnType<typeof runFirmwareCommand>>;
+  signal?: AbortSignal;
+  retainFailedClose?: (owner: OwnedFileHandle) => void;
 }): Promise<unknown> => {
   try {
-    return await readFirmwareReport(context.path, context.operation);
+    return await readFirmwareReport(context.path, context.operation, {
+      ...(context.signal !== undefined ? { signal: context.signal } : {}),
+      ...(context.retainFailedClose !== undefined
+        ? { retainFailedClose: context.retainFailedClose }
+        : {}),
+    });
   } catch (cause: unknown) {
+    if (cause instanceof RegularFileCleanupFailure) {
+      const cleanupError = firmwareFileCleanupError(
+        cause,
+        context.engine,
+        context.operation,
+        context.execution,
+      );
+      if (cause.outcome.kind === "completed") {
+        Object.assign(cleanupError, { completedReport: cause.outcome.value });
+      }
+      throw cleanupError;
+    }
     if (context.execution.exit_code === 1)
       throw new ProviderAdapterError(context.engine, context.operation, {
         cause,
