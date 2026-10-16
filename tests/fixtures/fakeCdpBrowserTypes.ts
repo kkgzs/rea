@@ -70,6 +70,8 @@ export interface FakeOptions {
   readonly malformedEventShapeOnMethod?: string;
   readonly closeOnMethod?: string;
   readonly hangOnMethod?: string;
+  /** Record matching commands without replying; tests send replies themselves. */
+  readonly holdReplyFor?: (command: FakeCdpCommand) => boolean;
   readonly unsupportedMethods?: readonly string[];
   readonly transitionalFrameReads?: number;
   readonly attachedFrameUrl?: string;

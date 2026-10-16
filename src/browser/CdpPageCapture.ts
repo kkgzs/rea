@@ -1,12 +1,16 @@
 import type { InspectWebPageInput } from "../domain/browserObservation.js";
 import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { ProgressReporter } from "../application/ProgressReporter.js";
+import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
 import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { stableWebResources } from "../domain/webInventory.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import { CdpConnection } from "./CdpConnection.js";
-import { CdpCaptureEvents } from "./CdpCaptureEvents.js";
+import {
+  CdpCaptureEvents,
+  type ResponseBodyCandidate,
+} from "./CdpCaptureEvents.js";
 import { authorizedMainFrame } from "./CdpAuthorizedMainFrame.js";
 import { captureStorage } from "./CdpCaptureStorage.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
@@ -27,6 +31,7 @@ import {
 } from "./CdpCaptureValues.js";
 import { captureScripts } from "./CdpPageCaptureScripts.js";
 import { captureWorkers } from "./CdpPageCaptureWorkers.js";
+import { CdpWorkerNetworkObservation } from "./CdpPageCaptureWorkerNetwork.js";
 import type { WebSourceMapRequest } from "./WebSourceMapFetcher.js";
 
 export interface CaptureContext {
@@ -46,6 +51,7 @@ export interface CaptureContext {
 interface CaptureState {
   readonly context: CaptureContext;
   readonly events: CdpCaptureEvents;
+  readonly workerNetwork: CdpWorkerNetworkObservation;
   readonly allowedOrigins: ReadonlySet<string>;
   readonly limitations: string[];
   readonly startedAt: string;
@@ -73,30 +79,43 @@ export const capturePage = async (
 ): Promise<CapturedPage> => {
   const allowedOrigins = new Set(context.input.allowed_origins);
   const events = new CdpCaptureEvents(context.input, allowedOrigins);
+  const limitations = [
+    "Observation starts when REA attaches; prior network and console activity is unavailable.",
+    "Raw network headers, bodies, cookies, storage values, console objects, and WebSocket payloads are never retained; explicitly requested primitive console text is retained verbatim, while payload captures retain value-free shapes.",
+    "Source maps are reported only as declarative URLs and are not fetched.",
+    "URL-less scripts and console events without an allowed source URL are excluded because their origin cannot be proven.",
+    ...(context.target.attached === null
+      ? [
+          "CDP discovery omitted the target attachment state; attached is reported as unknown.",
+        ]
+      : []),
+  ];
+  const workerNetwork = new CdpWorkerNetworkObservation(
+    context,
+    events,
+    allowedOrigins,
+    limitations,
+  );
   const removeListener = context.connection.onEvent((event) => {
-    if (event.sessionId !== context.sessionId) return;
-    events.ingest(event);
+    if (
+      event.sessionId === context.sessionId &&
+      workerNetwork.admitsPageEvent(event)
+    )
+      events.ingest(event);
+    workerNetwork.ingest(event);
   });
   const state: CaptureState = {
     context,
     events,
+    workerNetwork,
     allowedOrigins,
-    limitations: [
-      "Observation starts when REA attaches; prior network and console activity is unavailable.",
-      "Raw network headers, bodies, cookies, storage values, console objects, and WebSocket payloads are never retained; explicitly requested primitive console text is retained verbatim, while payload captures retain value-free shapes.",
-      "Source maps are reported only as declarative URLs and are not fetched.",
-      "URL-less scripts and console events without an allowed source URL are excluded because their origin cannot be proven.",
-      ...(context.target.attached === null
-        ? [
-            "CDP discovery omitted the target attachment state; attached is reported as unknown.",
-          ]
-        : []),
-    ],
+    limitations,
     startedAt: new Date().toISOString(),
   };
   try {
     return await captureAuthorizedPage(state);
   } finally {
+    await workerNetwork.close();
     removeListener();
   }
 };
@@ -162,6 +181,9 @@ const captureAuthorizedPage = async (
       null,
     );
   await report(context.progress, 3, "Normalizing browser evidence");
+  // Drain worker commands before the final page check so a navigation that
+  // lands while one is pending still reports `target_changed`.
+  await state.workerNetwork.settle();
   const completedFrameResult = await authorizedMainFrame({
     connection: context.connection,
     sessionId: context.sessionId,
@@ -207,19 +229,45 @@ const captureJsonResponseBodies = async (
       state.events.responseBodyUnavailable(candidate);
       continue;
     }
+    const owner = state.workerNetwork.responseBodySession(candidate.requestId);
+    if (owner === undefined) {
+      workerBodyDetached(state, candidate);
+      continue;
+    }
+    const workerOwned = owner.sessionId !== state.context.sessionId;
+    const signal =
+      owner.detached === undefined
+        ? state.context.signal
+        : state.context.signal === undefined
+          ? owner.detached
+          : AbortSignal.any([state.context.signal, owner.detached]);
     let result: unknown;
     try {
       result = await optionalCdpCommand(
-        state.context,
+        {
+          connection: state.context.connection,
+          sessionId: owner.sessionId,
+          ...(signal === undefined ? {} : { signal }),
+        },
         "Network.getResponseBody",
         { requestId: candidate.requestId },
         state.limitations,
       );
     } catch (cause: unknown) {
+      // Chrome never answers a read pending on a worker session that detaches.
+      if (
+        cause instanceof AnalysisCancelledError &&
+        owner.detached?.aborted === true &&
+        state.context.signal?.aborted !== true
+      ) {
+        workerBodyDetached(state, candidate);
+        continue;
+      }
+      // A worker session can also detach while its body read is in flight.
       if (
         !(cause instanceof CdpCommandRejection) ||
         cause.command !== "Network.getResponseBody" ||
-        cause.code !== -32_000 ||
+        (cause.code !== -32_000 && !(workerOwned && cause.code === -32_001)) ||
         cause.reportedMessage === null
       )
         throw cause;
@@ -237,6 +285,16 @@ const captureJsonResponseBodies = async (
       state.events.responseBodyUnavailable(remaining);
     return;
   }
+};
+
+const workerBodyDetached = (
+  state: CaptureState,
+  candidate: ResponseBodyCandidate,
+): void => {
+  state.events.responseBodyUnavailable(candidate);
+  state.limitations.push(
+    `Response body unavailable for request ${candidate.requestId}: its worker detached before REA read the body.`,
+  );
 };
 
 const authorizeObservationWindow = async (
@@ -258,6 +316,7 @@ const authorizeObservationWindow = async (
     throw new BrowserObservationError("inspect_web_page", "target_not_allowed");
   events.beginAuthorizedFrame(mainFrame.frame_id);
   await enableObservationDomains(connection, sessionId, signal);
+  await state.workerNetwork.start();
   await report(context.progress, 2, "Observing page events");
   await delayWithCancellation(
     context.input.observation_ms,
