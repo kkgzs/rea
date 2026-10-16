@@ -686,3 +686,51 @@ it("doctor verifies installed instructions and references even when metadata is 
     );
   }
 });
+
+it("preserves a retained partial skill instead of treating it as absent", async () => {
+  const home = await createTestTempDirectory("rea-skill-partial-identity-");
+  const [destination] = skillDestinations(home, ["shared"]);
+  if (destination === undefined) throw new Error("Missing shared skill root");
+  const reference = join(
+    destination.path,
+    "references/connection-and-recovery.md",
+  );
+  const retained = "retained managed reference bytes\n";
+
+  expect(await readInstalledSkillIdentity(home, ["shared"])).toBeUndefined();
+  await mkdir(dirname(reference), { recursive: true });
+  await writeFile(reference, retained);
+
+  expect(await readInstalledSkillIdentity(home, ["shared"])).toEqual({
+    canonical: false,
+    version: null,
+    toolCount: null,
+    manifestMissing: true,
+  });
+  expect(await canonicalSkillNeedsInstall(home, ["shared"])).toBe(true);
+  expect(await readFile(reference, "utf8")).toBe(retained);
+
+  const system = systemDoctorHost({
+    environment: { HOME: home, USERPROFILE: home },
+  });
+  const host = createDoctorHostFixture({
+    installedSkillIdentity: (registrations) =>
+      system.installedSkillIdentity?.(registrations) ??
+      Promise.resolve(undefined),
+  });
+  const report = await runDoctor(undefined, host);
+  expect(report.identity?.skill).toMatchObject({
+    installed_version: null,
+    installed_tool_count: null,
+    state: "partial",
+    remediation: "Run rea setup to update the installed REA skill.",
+  });
+  expect(report.checks).toContainEqual({
+    name: "skill:identity",
+    ok: false,
+    classification: "config_drift",
+    detail:
+      "Installed REA skill files are present without a readable skill manifest.",
+    remediation: "Run rea setup to update the installed REA skill.",
+  });
+});
