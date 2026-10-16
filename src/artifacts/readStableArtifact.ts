@@ -4,6 +4,7 @@ import { lstat, open, type FileHandle } from "node:fs/promises";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import type { ArtifactResourceScope } from "./ArtifactResourceScope.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+import type { RegularFileOperationOutcome } from "../filesystem/OwnedRegularFile.js";
 
 /** Filesystem boundary for stable reads, including deterministic replacement probes. */
 export interface StableArtifactFileSystem {
@@ -71,9 +72,11 @@ export const readStableArtifact = async (
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     ),
   );
-  const owner =
-    resourceScope === undefined ? undefined : new OwnedFileHandle(file);
-  let failure: unknown;
+  const owner = new OwnedFileHandle(file);
+  let outcome: RegularFileOperationOutcome<{
+    readonly bytes: Buffer;
+    readonly sha256: string;
+  }>;
   try {
     const initial = await file.stat({ bigint: true });
     if (
@@ -129,23 +132,40 @@ export const readStableArtifact = async (
       );
     assertReadActive(signal);
     const bytes = Buffer.concat(chunks, count);
-    return { bytes, sha256: createHash("sha256").update(bytes).digest("hex") };
+    outcome = {
+      kind: "completed",
+      value: {
+        bytes,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      },
+    };
   } catch (cause: unknown) {
-    failure = cause;
-    throw cause;
-  } finally {
-    if (owner === undefined || resourceScope === undefined) await file.close();
-    else {
-      const cleanup = await resourceScope.release({
-        kind: "file-handle",
-        resource: path,
-        handle: owner,
-      });
-      if (cleanup.kind === "failed")
-        throw ArtifactReaderFailure.withCleanup(
-          failure ?? cleanup.cause,
-          ArtifactReaderFailure.cleanupObservation(cleanup.cause, path),
-        );
-    }
+    outcome = { kind: "failed", cause };
   }
+  const cleanup =
+    resourceScope === undefined
+      ? await owner.close().then(
+          () => ({ kind: "released" as const }),
+          (cause: unknown) => ({ kind: "failed" as const, cause }),
+        )
+      : await resourceScope.release({
+          kind: "file-handle",
+          resource: path,
+          handle: owner,
+        });
+  if (cleanup.kind === "failed")
+    throw ArtifactReaderFailure.withCleanup(
+      outcome.kind === "failed" ? outcome.cause : cleanup.cause,
+      ArtifactReaderFailure.cleanupObservation(cleanup.cause, path),
+      undefined,
+      { owner, outcome },
+    );
+  if (outcome.kind === "failed") throw outcome.cause;
+  if (signal?.aborted === true)
+    throw new ArtifactReaderFailure("cancelled", "Artifact read cancelled", {
+      cause: signal.reason,
+      owner,
+      outcome,
+    });
+  return outcome.value;
 };

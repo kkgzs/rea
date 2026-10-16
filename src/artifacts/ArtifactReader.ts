@@ -8,9 +8,13 @@ import type {
   AnalysisCleanupObservation,
   AnalysisPartialObservation,
 } from "../domain/analysisErrorBase.js";
+import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
+import type { RegularFileOperationOutcome } from "../filesystem/OwnedRegularFile.js";
 
 export interface ArtifactReaderFailureOptions extends ErrorOptions {
   readonly cleanup?: AnalysisCleanupObservation;
+  readonly owner?: OwnedFileHandle;
+  readonly outcome?: RegularFileOperationOutcome<unknown>;
   readonly partialObservation?: AnalysisPartialObservation;
 }
 
@@ -131,6 +135,8 @@ export interface ArtifactReader {
 /** Typed adapter failure translated at provider boundary. */
 export class ArtifactReaderFailure extends Error {
   readonly cleanup: AnalysisCleanupObservation | undefined;
+  readonly owner: OwnedFileHandle | undefined;
+  readonly outcome: RegularFileOperationOutcome<unknown> | undefined;
   readonly partialObservation: AnalysisPartialObservation | undefined;
 
   constructor(
@@ -154,6 +160,8 @@ export class ArtifactReaderFailure extends Error {
     super(message, options);
     this.name = "ArtifactReaderFailure";
     this.cleanup = options?.cleanup;
+    this.owner = options?.owner;
+    this.outcome = options?.outcome;
     this.partialObservation = options?.partialObservation;
   }
 
@@ -162,11 +170,14 @@ export class ArtifactReaderFailure extends Error {
     cause: unknown,
     cleanup: AnalysisCleanupObservation,
     partialObservation?: AnalysisPartialObservation,
+    options?: Pick<ArtifactReaderFailureOptions, "owner" | "outcome">,
   ): ArtifactReaderFailure {
     const primary =
       cause instanceof ArtifactReaderFailure
         ? cause
         : new ArtifactReaderFailure("io", errorMessage(cause), { cause });
+    const mergedOwner = options?.owner ?? primary.owner;
+    const mergedOutcome = options?.outcome ?? primary.outcome;
     const mergedObservation = partialObservation ?? primary.partialObservation;
     return new ArtifactReaderFailure(
       primary.reason,
@@ -174,6 +185,8 @@ export class ArtifactReaderFailure extends Error {
       {
         cause: primary,
         cleanup: combineCleanup(primary.cleanup, cleanup),
+        ...(mergedOwner === undefined ? {} : { owner: mergedOwner }),
+        ...(mergedOutcome === undefined ? {} : { outcome: mergedOutcome }),
         ...(mergedObservation === undefined
           ? {}
           : { partialObservation: mergedObservation }),
