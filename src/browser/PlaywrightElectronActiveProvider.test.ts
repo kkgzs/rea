@@ -54,6 +54,54 @@ it("passes the selected environment and ownership token to Electron launch", asy
   });
 });
 
+it("omits application_path from args when executable matches application", async () => {
+  let launchedArgs: readonly string[] | undefined;
+  const provider = new PlaywrightElectronActiveProvider({}, async (options) => {
+    launchedArgs = options?.args;
+    throw new Error("launch boundary reached");
+  });
+  await provider.capture({
+    ...electronActiveObservationInputSchema.parse({
+      executable_path: process.execPath,
+      application_path: process.execPath,
+      args: ["--user-data-dir=/tmp/profile"],
+    }),
+    application_root: dirname(process.execPath),
+  });
+
+  expect(launchedArgs).toEqual([
+    "-r",
+    expect.stringMatching(/electron-active-hook\.cjs$/),
+    "--user-data-dir=/tmp/profile",
+  ]);
+});
+
+it("includes application_path in args when executable differs from application", async () => {
+  let launchedArgs: readonly string[] | undefined;
+  const provider = new PlaywrightElectronActiveProvider({}, async (options) => {
+    launchedArgs = options?.args;
+    throw new Error("launch boundary reached");
+  });
+  const tempDir = await createTestTempDirectory("rea-electron-app-");
+  const asarPath = join(tempDir, "app.asar");
+  await writeFile(asarPath, "");
+  await provider.capture({
+    ...electronActiveObservationInputSchema.parse({
+      executable_path: process.execPath,
+      application_path: asarPath,
+      args: ["--no-sandbox"],
+    }),
+    application_root: tempDir,
+  });
+
+  expect(launchedArgs).toEqual([
+    "-r",
+    expect.stringMatching(/electron-active-hook\.cjs$/),
+    asarPath,
+    "--no-sandbox",
+  ]);
+});
+
 it("passes required Windows runtime variables without inheriting unrelated values", () => {
   expect(
     safeElectronEnvironment(

@@ -597,6 +597,68 @@ const boundaries = createElectronActiveBoundaryPatches({
 });
 
 try {
+  if (Array.isArray(process.argv)) {
+    const isHook = (arg) =>
+      typeof arg === "string" &&
+      (arg.endsWith("electron-active-hook.cjs") ||
+        arg.endsWith("electron-active-hook.js") ||
+        arg.includes("electron-active-hook"));
+    for (let index = process.argv.length - 1; index >= 0; index--) {
+      const arg = process.argv[index];
+      if (typeof arg !== "string") continue;
+      if (isHook(arg)) {
+        if (
+          index > 0 &&
+          (process.argv[index - 1] === "-r" ||
+            process.argv[index - 1] === "--require")
+        ) {
+          process.argv.splice(index - 1, 2);
+        } else {
+          process.argv.splice(index, 1);
+        }
+      } else if (arg.startsWith("--require=") && isHook(arg)) {
+        process.argv.splice(index, 1);
+      }
+    }
+    if (!process.defaultApp) {
+      for (let index = process.argv.length - 1; index >= 1; index--) {
+        const arg = process.argv[index];
+        if (
+          typeof arg === "string" &&
+          (arg.endsWith(".asar") || arg.includes(".asar/"))
+        ) {
+          process.argv.splice(index, 1);
+        }
+      }
+    } else {
+      let appIndex = -1;
+      for (let index = 1; index < process.argv.length; index++) {
+        const arg = process.argv[index];
+        if (typeof arg === "string" && !arg.startsWith("-")) {
+          appIndex = index;
+          break;
+        }
+      }
+      if (appIndex > 1) {
+        const appArg = process.argv[appIndex];
+        const debugFlags = process.argv
+          .slice(1, appIndex)
+          .filter(
+            (arg) =>
+              typeof arg === "string" &&
+              (arg.startsWith("--inspect") ||
+                arg.startsWith("--remote-debugging-port")),
+          );
+        process.argv.splice(appIndex, 1);
+        process.argv.splice(1, 0, appArg);
+        for (const flag of debugFlags) {
+          const idx = process.argv.indexOf(flag);
+          if (idx !== -1) process.argv.splice(idx, 1);
+        }
+      }
+    }
+  }
+
   const electron = require("electron");
   patchEmitter(electron.app, (event, args) =>
     recordRuntime(
