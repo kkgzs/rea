@@ -1,4 +1,5 @@
 import { createServer } from "node:net";
+import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
@@ -12,11 +13,13 @@ import {
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CutterBridgeClient } from "../../../src/cutter/CutterBridgeClient.js";
 import { CutterBridgeService } from "../../../src/cutter/CutterBridgeService.js";
+import { readWithoutFifoWriter } from "../../fixtures/fifoInput.js";
 
 const listen = async (
   server: ReturnType<typeof createServer>,
@@ -619,6 +622,55 @@ describe("CutterBridgeClient: scenario group 3", () => {
       discovery_status: "bridge_directory_unavailable",
       bridge_directory_security: "not_checked",
     });
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "skips a writer-free FIFO descriptor without blocking discovery",
+    async () => {
+      directory = await mkdtemp(join(tmpdir(), "rea-cutter-fifo-"));
+      const sessionId = "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a";
+      const token = "synthetic-cutter-bridge-token-for-test";
+      const fifoPath = join(
+        directory,
+        `cutter-${process.pid}-3b1f6c2a-7d4e-4a2b-9f31-2c5d8e6a1b40.json`,
+      );
+      await promisify(execFile)("mkfifo", [fifoPath]);
+      server = authenticatedServer(token, sessionId, (_request, respond) =>
+        respond({ ok: true, session_id: sessionId }),
+      );
+      const port = await listen(server);
+      await writeDescriptor(directory, sessionId, port, token);
+
+      const outcome = await readWithoutFifoWriter(fifoPath, () =>
+        createClient({ REA_CUTTER_BRIDGE_DIR: directory }).listSessions(),
+      );
+      expect(outcome.state).toBe("completed");
+      if (outcome.state !== "completed")
+        throw new Error("Cutter discovery waited for a FIFO writer");
+      expect(outcome.result).toMatchObject({
+        discovery_status: "sessions_found",
+        bridge_directory_security: "private_verified",
+        sessions: [{ session_id: sessionId }],
+      });
+    },
+  );
+
+  it("settles discovery cancellation before any socket probe", async () => {
+    directory = await mkdtemp(join(tmpdir(), "rea-cutter-discovery-cancel-"));
+    const sessionId = "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a";
+    await writeDescriptor(
+      directory,
+      sessionId,
+      1234,
+      "synthetic-cutter-bridge-token-for-test",
+    );
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      createClient({ REA_CUTTER_BRIDGE_DIR: directory }).listSessions(
+        controller.signal,
+      ),
+    ).rejects.toThrow();
   });
 
   it("uses descriptor status values when a live bridge omits optional fields", async () => {

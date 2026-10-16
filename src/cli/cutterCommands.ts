@@ -24,7 +24,7 @@ export const registerCutterCommands = (
     args: z.object({}),
     run: () =>
       logCliCommand(logger, CLI_COMMANDS.listCutterSessions, () =>
-        cutter.listSessions(),
+        withCommandCancellation((signal) => cutter.listSessions(signal)),
       ),
   });
   cli.command(CLI_COMMANDS.cutterCommand, {
