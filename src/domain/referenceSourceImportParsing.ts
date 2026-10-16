@@ -6,6 +6,7 @@ import type {
   StringLiteral,
 } from "@babel/types";
 import { traverseJavaScriptAst } from "./javascript/javascriptSemanticTraversal.js";
+import { readExactJavaScriptLiteral } from "./javascript/javascriptAstValues.js";
 import {
   parseRecoveredJavaScript,
   parserPluginsForPath,
@@ -22,6 +23,7 @@ import {
   isImportExpression,
   isMemberExpression,
   isStringLiteral,
+  isTemplateLiteral,
   isTSExternalModuleReference,
   isTSImportEqualsDeclaration,
   isTSModuleDeclaration,
@@ -87,13 +89,21 @@ const isModuleExpression = (
 ): expression is StringLiteral | CallExpression =>
   isStringLiteral(expression) || isCallExpression(expression);
 
+/** An expression-free template supplies one exact string, like a quoted one. */
+const isExactTemplateExpression = (
+  expression: Node | null | undefined,
+): boolean =>
+  isTemplateLiteral(expression) && expression.expressions.length === 0;
+
 const moduleSpecifierFromExpression = (
   expression: Node | null | undefined,
 ):
   | { specifier: string; parseState: ReferenceSourceImportParseState }
   | undefined => {
-  if (isStringLiteral(expression))
-    return { specifier: expression.value, parseState: "parsed" };
+  if (expression === null || expression === undefined) return undefined;
+  const literal = readExactJavaScriptLiteral(expression);
+  if (literal.found && typeof literal.value === "string")
+    return { specifier: literal.value, parseState: "parsed" };
   if (
     isCallExpression(expression) &&
     isImport(expression.callee) &&
@@ -250,7 +260,7 @@ const extractRequireAndDynamicImports = (
     if (
       isRequireCallee(call.callee) &&
       unshadowedRequireCalls.has(call) &&
-      isModuleExpression(first)
+      (isModuleExpression(first) || isExactTemplateExpression(first))
     ) {
       const result = moduleSpecifierFromExpression(first);
       if (result !== undefined) {
