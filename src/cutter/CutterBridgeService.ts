@@ -17,7 +17,7 @@ import {
 import { CUTTER_PROVIDER_IDENTITY } from "./CutterBridgeClient.js";
 
 interface CutterBridgePort {
-  listSessions(): Promise<CutterBridgeDiscovery>;
+  listSessions(signal?: AbortSignal): Promise<CutterBridgeDiscovery>;
   confirmCommandCompletion?(
     sessionId: string,
     requestId: string,
@@ -30,6 +30,8 @@ interface CutterBridgePort {
     readonly json: boolean;
     readonly signal?: AbortSignal;
   }): Promise<CutterBridgeExecution>;
+  /** Retry closing owned descriptor handles; absent ports own no descriptors. */
+  retryCleanup?(): Promise<boolean>;
 }
 
 /** Shared Cutter bridge workflows used by the MCP adapter and CLI. */
@@ -74,8 +76,17 @@ export class CutterBridgeService {
     return ok(null);
   }
 
-  listSessions(): Promise<CutterBridgeDiscovery> {
-    return this.client.listSessions();
+  listSessions(signal?: AbortSignal): Promise<CutterBridgeDiscovery> {
+    return this.client.listSessions(signal);
+  }
+
+  /**
+   * Confirm descriptor handles left by failed discovery closes are released.
+   * A retained descriptor blocks a new command until its owner confirms close.
+   */
+  async #descriptorCleanupReady(): Promise<boolean> {
+    const retry = this.client.retryCleanup;
+    return retry === undefined ? true : retry.call(this.client);
   }
 
   async execute(
@@ -89,6 +100,23 @@ export class CutterBridgeService {
     const input = parsed.data;
     const cleanup = await this.retryCleanup();
     if (!cleanup.ok) return err(cleanup.error);
+    // A descriptor whose close was never confirmed keeps its ownership; do not
+    // start a new command until that handle is released.
+    if (!(await this.#descriptorCleanupReady()))
+      return err(
+        new AnalysisCapabilityUnavailableError(
+          "cutter",
+          "cutter_command",
+          "Cutter descriptor cleanup is incomplete; a retained handle blocks a new command until it is released.",
+          {
+            cleanup: {
+              reason:
+                "A descriptor handle from an earlier discovery could not be confirmed closed.",
+              resources: ["cutter-descriptor-handle"],
+            },
+          },
+        ),
+      );
     try {
       const output = await this.client.execute({
         sessionId: input.session_id,

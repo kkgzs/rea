@@ -25,19 +25,23 @@ export const registerCutterTools = (
 ): void => {
   const list = toolContract("list_cutter_sessions");
   const command = toolContract("cutter_command");
-  server.registerTool(list.name, toolRegistrationOptions(list), async () => {
-    const result = await logToolExecution(logger, list.name, async () =>
-      ok(await service.listSessions()),
-    );
-    if (!result.ok) return delivery.toCallToolResult(result, list);
-    return delivery.toCallToolResult(
-      {
-        ok: true,
-        value: { ...result.value, sessions: [...result.value.sessions] },
-      },
-      list,
-    );
-  });
+  server.registerTool(
+    list.name,
+    toolRegistrationOptions(list),
+    async (_input, context) => {
+      const result = await logToolExecution(logger, list.name, async () =>
+        ok(await service.listSessions(context.mcpReq.signal)),
+      );
+      if (!result.ok) return delivery.toCallToolResult(result, list);
+      return delivery.toCallToolResult(
+        {
+          ok: true,
+          value: { ...result.value, sessions: [...result.value.sessions] },
+        },
+        list,
+      );
+    },
+  );
   server.registerTool(
     command.name,
     toolRegistrationOptions(command),

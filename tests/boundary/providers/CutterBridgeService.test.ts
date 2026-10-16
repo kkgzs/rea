@@ -404,3 +404,75 @@ it("shares one cleanup attempt when commands retry the same receipt together", a
   expect(confirms).toBe(1);
   expect(dispatches).toBe(3);
 });
+
+it("blocks a new command while a retained descriptor cleanup is unconfirmed", async () => {
+  let cleanupReady = false;
+  let dispatches = 0;
+  const service = new CutterBridgeService({
+    listSessions: async () => ({
+      sessions: [],
+      bridge_directory: "/private/bridge",
+      discovery_status: "no_live_bridge_found",
+      bridge_directory_security: "private_verified",
+    }),
+    retryCleanup: async () => cleanupReady,
+    execute: async () => {
+      dispatches += 1;
+      return {
+        requestId: "4b18ce4d-bf31-456e-ae31-e8c547b2f9db",
+        output: "complete",
+        currentFile: "/fixtures/sample.bin",
+        documentGeneration: 7,
+        identityStatus: "partial" as const,
+        cutterVersion: null,
+        executionState: "complete" as const,
+        error: null,
+        message: null,
+        outputTruncated: false,
+      };
+    },
+  });
+
+  const blocked = await service.execute({
+    session_id: "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a",
+    expected_generation: 7,
+    command: "pd 4",
+  });
+  expect(blocked.ok).toBe(false);
+  if (!blocked.ok)
+    expect(blocked.error).toMatchObject({
+      cleanupResources: ["cutter-descriptor-handle"],
+    });
+  expect(dispatches).toBe(0);
+
+  cleanupReady = true;
+  const released = await service.execute({
+    session_id: "27d3e3f1-f1e5-49ae-91ec-95af1f343a5a",
+    expected_generation: 7,
+    command: "pd 4",
+  });
+  expect(released.ok).toBe(true);
+  expect(dispatches).toBe(1);
+});
+
+it("forwards the discovery signal to the bridge port", async () => {
+  const controller = new AbortController();
+  let observed: AbortSignal | undefined;
+  const service = new CutterBridgeService({
+    listSessions: async (signal) => {
+      observed = signal;
+      return {
+        sessions: [],
+        bridge_directory: "/private/bridge",
+        discovery_status: "no_live_bridge_found",
+        bridge_directory_security: "private_verified",
+      };
+    },
+    execute: async () => {
+      throw new Error("not used");
+    },
+  });
+
+  await service.listSessions(controller.signal);
+  expect(observed).toBe(controller.signal);
+});

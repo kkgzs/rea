@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { createConnection } from "node:net";
-import { lstat, open, opendir } from "node:fs/promises";
+import { lstat, opendir } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -15,6 +14,12 @@ import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { requireWindowsNativeAuthority } from "../windows/WindowsNativeLoader.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
+import {
+  NonRegularFileReadError,
+  RegularFileAdmissionFailure,
+  openRegularFile,
+} from "../filesystem/RegularFile.js";
+import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { homeDirectoryFromEnvironment } from "../config/homeDirectory.js";
 
 const descriptorSchema = z.object({
@@ -246,6 +251,12 @@ export class CutterBridgeClient {
   readonly #platform: NodeJS.Platform;
   readonly #windowsPrivateReader: WindowsCutterDescriptorReader | undefined;
   readonly #pendingAcknowledgements = new Map<string, Set<string>>();
+  /**
+   * Descriptor handles whose close could not be confirmed. Ownership is
+   * retained so a later cleanup can retry the close instead of discarding a
+   * failure; discovery treats a pending owner as unverified.
+   */
+  readonly #descriptorOwners = new Set<OwnedFileHandle>();
 
   constructor(
     environment: Readonly<NodeJS.ProcessEnv> = process.env,
@@ -286,8 +297,8 @@ export class CutterBridgeClient {
     );
   }
 
-  async listSessions(): Promise<CutterBridgeDiscovery> {
-    const loaded = await this.#readDescriptors();
+  async listSessions(signal?: AbortSignal): Promise<CutterBridgeDiscovery> {
+    const loaded = await this.#readDescriptors(signal);
     if (loaded.error !== undefined)
       return {
         sessions: [],
@@ -299,6 +310,7 @@ export class CutterBridgeClient {
       loaded.descriptors,
       async (descriptor) => {
         try {
+          signal?.throwIfAborted();
           const status = responseSchema.safeParse(
             await this.#request(
               descriptor,
@@ -306,6 +318,7 @@ export class CutterBridgeClient {
                 kind: "status",
                 session_id: descriptor.session_id,
               }),
+              signal,
             ),
           );
           if (
@@ -352,7 +365,7 @@ export class CutterBridgeClient {
     readonly signal?: AbortSignal;
   }): Promise<CutterBridgeExecution> {
     input.signal?.throwIfAborted();
-    const descriptor = await this.#find(input.sessionId);
+    const descriptor = await this.#find(input.sessionId, input.signal);
     input.signal?.throwIfAborted();
     const requestId = randomUUID();
     const commandRequest = serializeRequest(descriptor, {
@@ -592,8 +605,12 @@ export class CutterBridgeClient {
     }
   }
 
-  async #find(sessionId: string): Promise<z.infer<typeof descriptorSchema>> {
-    const loaded = await this.#readDescriptors();
+  async #find(
+    sessionId: string,
+    signal?: AbortSignal,
+  ): Promise<z.infer<typeof descriptorSchema>> {
+    const loaded = await this.#readDescriptors(signal);
+    signal?.throwIfAborted();
     if (loaded.error === "bridge_directory_capacity_exceeded")
       throw new AnalysisResourceConstraintError(
         "cutter_command",
@@ -618,14 +635,32 @@ export class CutterBridgeClient {
     return descriptor;
   }
 
-  async listDescriptors(): Promise<
-    readonly z.infer<typeof descriptorSchema>[]
-  > {
-    const loaded = await this.#readDescriptors();
+  async listDescriptors(
+    signal?: AbortSignal,
+  ): Promise<readonly z.infer<typeof descriptorSchema>[]> {
+    const loaded = await this.#readDescriptors(signal);
     return loaded.descriptors;
   }
 
-  async #readDescriptors(): Promise<{
+  /**
+   * Retry closing descriptor handles whose earlier close was not confirmed.
+   * Returns true only when every retained owner is confirmed closed; a handle
+   * that still fails stays owned for a later attempt.
+   */
+  async retryCleanup(): Promise<boolean> {
+    let complete = true;
+    for (const owner of [...this.#descriptorOwners]) {
+      try {
+        await owner.close();
+        this.#descriptorOwners.delete(owner);
+      } catch {
+        complete = false;
+      }
+    }
+    return complete;
+  }
+
+  async #readDescriptors(signal?: AbortSignal): Promise<{
     readonly descriptors: readonly z.infer<typeof descriptorSchema>[];
     readonly security:
       | "private_verified"
@@ -637,6 +672,7 @@ export class CutterBridgeClient {
       | "bridge_directory_insecure"
       | "bridge_directory_capacity_exceeded";
   }> {
+    signal?.throwIfAborted();
     let directoryInfo;
     try {
       directoryInfo = await lstat(this.#directory);
@@ -719,8 +755,9 @@ export class CutterBridgeClient {
       };
     }
     const loaded = await mapDiscovery(entries, async (entry) => {
-      let file;
+      let owner: OwnedFileHandle | undefined;
       try {
+        signal?.throwIfAborted();
         let bytes: Buffer;
         if (this.#platform === "win32") {
           bytes = windowsPrivateReader!.readDescriptor(
@@ -729,19 +766,26 @@ export class CutterBridgeClient {
             MAX_DESCRIPTOR_BYTES,
           );
         } else {
-          const flags = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0);
-          file = await open(join(this.#directory, entry), flags);
-          const info = await file.stat();
+          // Admit the descriptor through the canonical nonblocking primitive:
+          // a candidate that is a FIFO without a writer must be skipped instead
+          // of blocking discovery on a pipe open. Admission keeps the symlink,
+          // ownership, mode and byte checks and retains a failed close.
+          const handle = await openRegularFile(join(this.#directory, entry), {
+            symlinks: "reject",
+            signal,
+          });
+          owner = new OwnedFileHandle(handle);
+          const info = await handle.stat();
           if (
-            !info.isFile() ||
             info.size > MAX_DESCRIPTOR_BYTES ||
             info.uid !== currentUid ||
             (info.mode & 0o077) !== 0
           )
             return undefined;
           const boundedBytes = await readBoundedFileBytes(
-            file,
+            handle,
             MAX_DESCRIPTOR_BYTES,
+            signal,
           );
           if (boundedBytes === undefined) return undefined;
           bytes = boundedBytes;
@@ -756,10 +800,26 @@ export class CutterBridgeClient {
         )
           return undefined;
         return parsed.data;
-      } catch {
+      } catch (cause: unknown) {
+        // A non-regular candidate (FIFO, socket, directory) is not a descriptor.
+        if (cause instanceof NonRegularFileReadError) return undefined;
+        // Admission opened an owned descriptor whose close could not be
+        // confirmed; retain that owner so a later cleanup retries the close
+        // instead of discarding the failure.
+        if (cause instanceof RegularFileAdmissionFailure) {
+          this.#descriptorOwners.add(cause.owner);
+          return undefined;
+        }
         return undefined;
       } finally {
-        await file?.close().catch(() => undefined);
+        if (owner !== undefined) {
+          try {
+            await owner.close();
+          } catch {
+            // Retain ownership; the handle must not be reported as closed.
+            this.#descriptorOwners.add(owner);
+          }
+        }
       }
     });
     return {
