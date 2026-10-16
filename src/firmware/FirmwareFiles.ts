@@ -1,13 +1,6 @@
 import { createHash } from "node:crypto";
-import { constants, createReadStream, createWriteStream } from "node:fs";
-import {
-  chmod,
-  lstat,
-  opendir,
-  open,
-  readlink,
-  realpath,
-} from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { chmod, lstat, opendir, readlink, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, sep } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -18,6 +11,8 @@ import {
 } from "../domain/analysisErrorCore.js";
 import type { FirmwareRequest } from "../domain/firmware/firmwareAnalysis.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
+import { withOwnedRegularFile } from "../filesystem/OwnedRegularFile.js";
+import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
 import { FIRMWARE_LIMITS } from "./FirmwareRelease.js";
 import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
@@ -41,21 +36,35 @@ const throwIfFirmwareInventoryCancelled = (
 /** Hash a regular tool or extracted file without retaining its bytes in memory. */
 export const hashFirmwareFile = async (
   path: string,
-  signal?: AbortSignal,
+  options?:
+    | {
+        signal?: AbortSignal;
+        retainFailedClose?: (owner: OwnedFileHandle) => void;
+      }
+    | AbortSignal,
 ): Promise<string> => {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  const hash = createHash("sha256");
-  try {
-    if (!(await handle.stat()).isFile())
-      throw new Error(`Not a regular file: ${path}`);
-    for await (const chunk of handle.createReadStream({ autoClose: false })) {
-      signal?.throwIfAborted();
-      hash.update(chunk);
-    }
-  } finally {
-    await handle.close();
-  }
-  return hash.digest("hex");
+  const opts =
+    options instanceof AbortSignal ? { signal: options } : (options ?? {});
+  return withOwnedRegularFile(
+    path,
+    {
+      symlinks: "reject",
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+      ...(opts.retainFailedClose !== undefined
+        ? { retainFailedClose: opts.retainFailedClose }
+        : {}),
+    },
+    async (handle) => {
+      if (!(await handle.stat()).isFile())
+        throw new Error(`Not a regular file: ${path}`);
+      const hash = createHash("sha256");
+      for await (const chunk of handle.createReadStream({ autoClose: false })) {
+        opts.signal?.throwIfAborted();
+        hash.update(chunk);
+      }
+      return hash.digest("hex");
+    },
+  );
 };
 
 /** Copy and identify the exact bytes consumed by firmware providers. */
@@ -63,47 +72,53 @@ export const snapshotFirmware = async (
   request: FirmwareRequest,
   root: string,
   signal: AbortSignal,
+  retainFailedClose?: (owner: OwnedFileHandle) => void,
 ) => {
   const sourcePath = absoluteCallerPath(request.input.path);
   const source = await realpath(sourcePath);
-  const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
   const fullPath = join(root, "firmware.bin");
   const hash = createHash("sha256");
   let size = 0;
-  try {
-    const stat = await handle.stat();
-    if (
-      !stat.isFile() ||
-      stat.size === 0 ||
-      stat.size > FIRMWARE_LIMITS.inputBytes
-    )
-      throw new AnalysisInputError(request.operation, undefined, [
-        {
-          path: ["path"],
-          reason: "out_of_range",
-          message: `Firmware must be a nonempty regular file no larger than ${FIRMWARE_LIMITS.inputBytes} bytes`,
+  await withOwnedRegularFile(
+    source,
+    {
+      symlinks: "reject",
+      signal,
+      ...(retainFailedClose !== undefined ? { retainFailedClose } : {}),
+    },
+    async (handle) => {
+      const stat = await handle.stat();
+      if (
+        !stat.isFile() ||
+        stat.size === 0 ||
+        stat.size > FIRMWARE_LIMITS.inputBytes
+      )
+        throw new AnalysisInputError(request.operation, undefined, [
+          {
+            path: ["path"],
+            reason: "out_of_range",
+            message: `Firmware must be a nonempty regular file no larger than ${FIRMWARE_LIMITS.inputBytes} bytes`,
+          },
+        ]);
+      const meter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          size += chunk.length;
+          if (size > FIRMWARE_LIMITS.inputBytes) {
+            callback(new Error("Firmware grew beyond the input byte budget"));
+            return;
+          }
+          hash.update(chunk);
+          callback(null, chunk);
         },
-      ]);
-    const meter = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        size += chunk.length;
-        if (size > FIRMWARE_LIMITS.inputBytes) {
-          callback(new Error("Firmware grew beyond the input byte budget"));
-          return;
-        }
-        hash.update(chunk);
-        callback(null, chunk);
-      },
-    });
-    await pipeline(
-      handle.createReadStream({ autoClose: false }),
-      meter,
-      createWriteStream(fullPath, { flags: "wx", mode: 0o600 }),
-      { signal },
-    );
-  } finally {
-    await handle.close();
-  }
+      });
+      await pipeline(
+        handle.createReadStream({ autoClose: false }),
+        meter,
+        createWriteStream(fullPath, { flags: "wx", mode: 0o600 }),
+        { signal },
+      );
+    },
+  );
   await chmod(fullPath, 0o400);
   const sha256 = hash.digest("hex");
   const selected =
@@ -138,7 +153,10 @@ export const snapshotFirmware = async (
       sha256:
         selected === undefined
           ? sha256
-          : await hashFirmwareFile(inputPath, signal),
+          : await hashFirmwareFile(inputPath, {
+              signal,
+              ...(retainFailedClose !== undefined ? { retainFailedClose } : {}),
+            }),
     },
   };
 };
@@ -147,37 +165,52 @@ export const snapshotFirmware = async (
 export const readFirmwareReport = async (
   path: string,
   operation: string,
+  options?: {
+    signal?: AbortSignal;
+    retainFailedClose?: (owner: OwnedFileHandle) => void;
+  },
 ): Promise<unknown> => {
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    if (!(await handle.stat()).isFile())
-      throw new AnalysisOutputError(operation, "Report is not a regular file");
-    const bytes = await readBoundedFileBytes(
-      handle,
-      FIRMWARE_LIMITS.reportBytes,
-    );
-    if (bytes === undefined)
-      throw new AnalysisOutputError(
-        operation,
-        `Report exceeded ${FIRMWARE_LIMITS.reportBytes} bytes`,
+  return withOwnedRegularFile(
+    path,
+    {
+      symlinks: "reject",
+      ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+      ...(options?.retainFailedClose !== undefined
+        ? { retainFailedClose: options.retainFailedClose }
+        : {}),
+    },
+    async (handle) => {
+      if (!(await handle.stat()).isFile())
+        throw new AnalysisOutputError(
+          operation,
+          "Report is not a regular file",
+        );
+      const bytes = await readBoundedFileBytes(
+        handle,
+        FIRMWARE_LIMITS.reportBytes,
+        options?.signal,
       );
-    try {
-      const value: unknown = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-          bytes,
-        ),
-      );
-      return value;
-    } catch (cause: unknown) {
-      throw new AnalysisOutputError(
-        operation,
-        "Tool report is not valid complete JSON",
-        { cause },
-      );
-    }
-  } finally {
-    await handle.close();
-  }
+      if (bytes === undefined)
+        throw new AnalysisOutputError(
+          operation,
+          `Report exceeded ${FIRMWARE_LIMITS.reportBytes} bytes`,
+        );
+      try {
+        const value: unknown = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+            bytes,
+          ),
+        );
+        return value;
+      } catch (cause: unknown) {
+        throw new AnalysisOutputError(
+          operation,
+          "Tool report is not valid complete JSON",
+          { cause },
+        );
+      }
+    },
+  );
 };
 
 /** Inventory private output without following links, enforcing aggregate staging budgets. */

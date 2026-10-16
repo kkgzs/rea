@@ -9,6 +9,9 @@ import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { jsonValueSchema } from "../domain/jsonValue.js";
 import { firmwareResultSchemas } from "../domain/firmware/firmwareAnalysis.js";
 import { hashFirmwareFile, type FirmwareEntry } from "./FirmwareFiles.js";
+import { firmwareFileCleanupError } from "./FirmwareCommand.js";
+import { RegularFileCleanupFailure } from "../filesystem/OwnedRegularFile.js";
+import type { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import type { normalizeUnblobReport } from "./FirmwareReports.js";
 import type { extractionGap } from "../domain/firmware/firmwareAnalysis.js";
 
@@ -90,6 +93,7 @@ export const publishFirmwareExtraction = async (context: {
   engine: z.infer<typeof firmwareResultSchemas.extract_firmware>["engine"];
   signal: AbortSignal;
   retainCleanup: (tree: SafeOutputTree) => void;
+  retainFailedClose?: (owner: OwnedFileHandle, path: string) => void;
 }) => {
   let tree: SafeOutputTree | undefined;
   let result:
@@ -122,7 +126,11 @@ export const publishFirmwareExtraction = async (context: {
       }
       const logicalPath = `$output/${entry.relativePath}`;
       const reported = context.normalized.files.get(logicalPath);
-      const sha256 = await hashFirmwareFile(entry.path, context.signal);
+      const sha256 = await hashFirmwareFile(entry.path, {
+        signal: context.signal,
+        retainFailedClose: (owner) =>
+          context.retainFailedClose?.(owner, entry.path),
+      });
       if (
         (reported?.sha256 !== null &&
           reported?.sha256 !== undefined &&
@@ -209,6 +217,9 @@ export const publishFirmwareExtraction = async (context: {
       );
     }
     if (tree?.published === true && result !== undefined) return result;
+    if (cause instanceof RegularFileCleanupFailure) {
+      throw firmwareFileCleanupError(cause, "unblob", "extract_firmware");
+    }
     throw cause;
   }
 };
