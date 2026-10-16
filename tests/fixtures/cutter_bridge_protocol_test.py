@@ -221,6 +221,34 @@ def run_serve_mode():
         server.join(timeout=3)
 
 
+class ResponseEncodingTest(unittest.TestCase):
+    def setUp(self):
+        self.server = bridge._BridgeServer.__new__(bridge._BridgeServer)
+        self.server.token = "test-token"
+        self.server.session_id = str(uuid.uuid4())
+
+    def test_large_mixed_unicode_output_fits_the_authenticated_frame(self):
+        for suffix in ("a", "é", "雪", "😀"):
+            with self.subTest(suffix=suffix):
+                output = "a" * (5 * 1024 * 1024 - 1) + suffix
+                value = {"ok": True, "output": output, "execution_state": "complete"}
+                encoded = self.server._encode_authenticated_response(value, "a" * 64, "b" * 64)
+                self.assertIsNotNone(encoded)
+                self.assertLessEqual(len(encoded), bridge.MAX_FRAME_BYTES)
+                frame = json.loads(encoded)
+                self.assertEqual(json.loads(frame["response"]), value)
+                expected = hmac.new(
+                    self.server.token.encode(),
+                    f"rea-cutter-response-v2:{self.server.session_id}:{'a' * 64}:{'b' * 64}:{frame['response']}".encode(),
+                    hashlib.sha256,
+                ).hexdigest()
+                self.assertTrue(hmac.compare_digest(frame["proof"], expected))
+        self.assertIsNone(self.server._encode_authenticated_response({
+            "ok": True, "output": "😀" * (5 * 1024 * 1024),
+            "execution_state": "complete",
+        }, "a" * 64, "b" * 64))
+
+
 class ProtocolProducerTest(unittest.TestCase):
     def test_rejects_legacy_peers_before_ui_dispatch(self):
         with socket.create_connection(("127.0.0.1", self.server.port), timeout=2) as connection:
